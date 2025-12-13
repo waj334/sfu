@@ -109,3 +109,25 @@ func TestMetadata(t *testing.T) {
 
 	require.Equal(t, true, state)
 }
+
+func TestMetadataDeadlock(t *testing.T) {
+	m := NewMetadata()
+	m.Set("key1", "value1")
+
+	// Case 1: Call Set inside ForEach callback (should deadlock without fix)
+	done := make(chan bool)
+	go func() {
+		m.ForEach(func(key string, value interface{}) {
+			// This causes deadlock because ForEach holds RLock and Set needs Lock
+			m.Set("key2", "value2")
+		})
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// success
+	case <-time.After(1 * time.Second):
+		t.Fatal("Timeout: Deadlock detected in ForEach -> Set")
+	}
+}

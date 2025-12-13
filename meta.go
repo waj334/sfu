@@ -72,18 +72,28 @@ func (m *Metadata) Delete(key string) error {
 
 func (m *Metadata) ForEach(f func(key string, value interface{})) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
+	// copy the map to avoid deadlock
+	mm := make(map[string]interface{}, len(m.m))
 	for k, v := range m.m {
+		mm[k] = v
+	}
+	m.mu.RUnlock()
+
+	for k, v := range mm {
 		f(k, v)
 	}
 }
 
 func (m *Metadata) onChanged(key string, value interface{}) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	// copy the callbacks to avoid deadlock
+	callbacks := make([]func(key string, value interface{}), 0, len(m.onChangedCallbacks))
 	for _, f := range m.onChangedCallbacks {
+		callbacks = append(callbacks, f)
+	}
+	m.mu.Unlock()
+
+	for _, f := range callbacks {
 		f(key, value)
 	}
 }
