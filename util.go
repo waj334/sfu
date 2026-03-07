@@ -92,7 +92,10 @@ func GetReceiverStats(pc *webrtc.PeerConnection, statsGetter stats.Getter) map[w
 	stats := make(map[webrtc.SSRC]stats.Stats)
 	for _, t := range pc.GetTransceivers() {
 		if t.Receiver() != nil && t.Receiver().Track() != nil {
-			stats[t.Receiver().Track().SSRC()] = *statsGetter.Get(uint32(t.Receiver().Track().SSRC()))
+			g := statsGetter.Get(uint32(t.Receiver().Track().SSRC()))
+			if g != nil {
+				stats[t.Receiver().Track().SSRC()] = *g
+			}
 		}
 	}
 
@@ -104,7 +107,10 @@ func GetSenderStats(pc *webrtc.PeerConnection, statsGetter stats.Getter) map[web
 	for _, t := range pc.GetTransceivers() {
 		if t.Sender() != nil && t.Sender().Track() != nil {
 			ssrc := t.Sender().GetParameters().Encodings[0].SSRC
-			stats[ssrc] = *statsGetter.Get(uint32(ssrc))
+			g := statsGetter.Get(uint32(ssrc))
+			if g != nil {
+				stats[ssrc] = *g
+			}
 		}
 	}
 
@@ -420,8 +426,7 @@ func StartTurnServer(ctx context.Context, publicIP string) *turn.Server {
 	return s
 }
 
-func StartStunServer(ctx context.Context, publicIP string) *turn.Server {
-	port := 3478
+func StartStunServer(ctx context.Context, publicIP string, port int) (*turn.Server, string) {
 	if len(publicIP) == 0 {
 		log.Fatalf("'public-ip' is required")
 	}
@@ -431,8 +436,11 @@ func StartStunServer(ctx context.Context, publicIP string) *turn.Server {
 	// this allows us to add logging, storage or modify inbound/outbound traffic
 	udpListener, err := net.ListenPacket("udp4", "0.0.0.0:"+strconv.Itoa(port))
 	if err != nil {
-		log.Panicf("Failed to create STUN server listener: %s", err)
+		log.Panicf("Failed to create STUN server listener at %d: %s", port, err)
 	}
+
+	listenAddr := udpListener.LocalAddr().String()
+	log.Printf("STUN server started at %s", listenAddr)
 
 	s, err := turn.NewServer(turn.ServerConfig{
 		// PacketConnConfigs is a list of UDP Listeners and the configuration around them
@@ -456,7 +464,7 @@ func StartStunServer(ctx context.Context, publicIP string) *turn.Server {
 		}
 	}()
 
-	return s
+	return s, listenAddr
 }
 
 func GetLocalIp() (net.IP, error) {

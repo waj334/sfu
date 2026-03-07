@@ -10,6 +10,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/inlivedev/sfu"
@@ -68,6 +69,27 @@ const (
 
 var logger logging.LeveledLogger
 
+// checkFlexFECInSDP checks if FlexFEC is present in the SDP and logs the findings
+func checkFlexFECInSDP(sdp string, sdpType string, clientID string) {
+	lines := strings.Split(sdp, "\n")
+	var flexfecLines []string
+
+	for _, line := range lines {
+		if strings.Contains(line, "126") && (strings.Contains(line, "flexfec") || strings.Contains(line, "rtpmap") || strings.Contains(line, "fmtp")) {
+			flexfecLines = append(flexfecLines, strings.TrimSpace(line))
+		}
+	}
+
+	if len(flexfecLines) > 0 {
+		logger.Infof("FlexFEC detected in %s SDP for client %s:", sdpType, clientID)
+		for _, line := range flexfecLines {
+			logger.Infof("  %s", line)
+		}
+	} else {
+		logger.Infof("FlexFEC NOT found in %s SDP for client %s", sdpType, clientID)
+	}
+}
+
 func main() {
 	_ = os.Setenv("logtostderr", "true")
 	os.Setenv("stderrthreshold", "TRACE")
@@ -92,9 +114,9 @@ func main() {
 
 	_, turnEnabled := os.LookupEnv("TURN_ENABLED")
 	if turnEnabled || fakeClientCount > 0 {
-		sfu.StartStunServer(ctx, "127.0.0.1")
+		_, stunAddr := sfu.StartStunServer(ctx, "127.0.0.1", 3478)
 		sfuOpts.IceServers = append(sfuOpts.IceServers, webrtc.ICEServer{
-			URLs: []string{"stun:127.0.0.1:3478"},
+			URLs: []string{"stun:" + stunAddr},
 		})
 	}
 
@@ -207,6 +229,7 @@ func clientHandler(isDebug bool, conn *websocket.Conn, messageChan chan Request,
 	opts := sfu.DefaultClientOptions()
 	opts.EnableOpusDTX = true
 	opts.EnableVoiceDetection = true
+	opts.EnableFlexFEC = true
 	opts.ReorderPackets = false
 	opts.PacerType = sfu.PacerTypeLeakyBucket // or sfu.PacerTypeLeakyBucket
 	client, err := r.AddClient(clientID, clientID, opts)
@@ -273,6 +296,9 @@ func clientHandler(isDebug bool, conn *websocket.Conn, messageChan chan Request,
 		// SFU request a renegotiation, send the offer to client
 		logger.Infof("receive renegotiation offer from SFU")
 
+		// Check for FlexFEC in the offer SDP
+		checkFlexFECInSDP(offer.SDP, "renegotiation offer", client.ID())
+
 		resp := Respose{
 			Status: true,
 			Type:   TypeOffer,
@@ -295,6 +321,10 @@ func clientHandler(isDebug bool, conn *websocket.Conn, messageChan chan Request,
 			return webrtc.SessionDescription{}, errors.New("timeout on renegotiation")
 		case answer := <-answerChan:
 			logger.Infof("received answer from client ", client.Type(), client.ID())
+
+			// Check for FlexFEC in the answer SDP
+			checkFlexFECInSDP(answer.SDP, "renegotiation answer", client.ID())
+
 			return answer, nil
 		}
 	})
@@ -371,6 +401,11 @@ func clientHandler(isDebug bool, conn *websocket.Conn, messageChan chan Request,
 
 				if req.Type == TypeOffer {
 					// handle as offer SDP
+					logger.Infof("received initial offer from client %s", client.ID())
+
+					// Check for FlexFEC in the incoming offer SDP
+					checkFlexFECInSDP(sdp, "initial offer", client.ID())
+
 					answer, err := client.Negotiate(webrtc.SessionDescription{SDP: sdp, Type: webrtc.SDPTypeOffer})
 					if err != nil {
 						logger.Errorf("error on negotiate", err)
@@ -381,6 +416,9 @@ func clientHandler(isDebug bool, conn *websocket.Conn, messageChan chan Request,
 							Data:   err.Error(),
 						}
 					} else {
+						// Check for FlexFEC in the answer SDP we're sending back
+						checkFlexFECInSDP(answer.SDP, "initial answer", client.ID())
+
 						// send the answer to client
 						resp = Respose{
 							Status: true,
@@ -393,7 +431,11 @@ func clientHandler(isDebug bool, conn *websocket.Conn, messageChan chan Request,
 
 					conn.Write(respBytes)
 				} else {
-					logger.Infof("receive renegotiation answer from client")
+					logger.Infof("receive renegotiation answer from client %s", client.ID())
+
+					// Check for FlexFEC in the renegotiation answer SDP from client
+					checkFlexFECInSDP(sdp, "client renegotiation answer", client.ID())
+
 					// handle as answer SDP as part of renegotiation request from SFU
 					// pass the answer to onRenegotiation handler above
 					answerChan <- webrtc.SessionDescription{SDP: sdp, Type: webrtc.SDPTypeAnswer}

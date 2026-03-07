@@ -9,7 +9,8 @@
       "Bash(grep:*)",
       "Bash(go build:*)",
       "Bash(go fmt:*)",
-      "Bash(go vet:*)"
+      "Bash(go vet:*)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ],
     "deny": []
   }

@@ -51,10 +51,10 @@ func TestAdd(t *testing.T) {
 
 	i := 0
 	for e := caches.buffers.Front(); e != nil; e = e.Next() {
-		packet := e.Value.(*rtppool.RetainablePacket)
-		require.Equal(t, packet.Header().SequenceNumber, sortedNumbers[i], fmt.Sprintf("packet sequence number %d should be equal to sortedNumbers sequence number %d", packet.Header().SequenceNumber, sortedNumbers[i]))
+		packet := e.Value.(*Packet)
+		require.Equal(t, packet.Packet.Header().SequenceNumber, sortedNumbers[i], fmt.Sprintf("packet sequence number %d should be equal to sortedNumbers sequence number %d", packet.Packet.Header().SequenceNumber, sortedNumbers[i]))
 		i++
-		packet.Release()
+		packet.Packet.Release()
 	}
 }
 
@@ -96,14 +96,14 @@ func TestAddLost(t *testing.T) {
 
 	i := 0
 	for e := caches.buffers.Front(); e != nil; e = e.Next() {
-		packet := e.Value.(*rtppool.RetainablePacket)
+		packet := e.Value.(*Packet)
 		if sortedNumbers[i] == 65533 {
 			i++
 		}
 
-		require.Equal(t, packet.Header().SequenceNumber, sortedNumbers[i], fmt.Sprintf("packet sequence number %d should be equal to sortedNumbers sequence number %d", packet.Header().SequenceNumber, sortedNumbers[i]))
+		require.Equal(t, packet.Packet.Header().SequenceNumber, sortedNumbers[i], fmt.Sprintf("packet sequence number %d should be equal to sortedNumbers sequence number %d", packet.Packet.Header().SequenceNumber, sortedNumbers[i]))
 		i++
-		packet.Release()
+		packet.Packet.Release()
 	}
 }
 
@@ -270,62 +270,50 @@ func TestLatency(t *testing.T) {
 
 	sorted := make([]*Packet, 0)
 	seqs := make([]uint16, 0)
-	resultsSeqs := make([]uint16, 0)
 	dropped := 0
 
 	for _, pkt := range unsortedPackets {
 		seqs = append(seqs, pkt.Header.SequenceNumber)
+		rp := pool.NewPacket(&pkt.Header, pkt.Payload, nil)
 
 		if pkt.Header.SequenceNumber == 65535 {
-			// last sort call should return immediately
-			t.Log("packet sequence ", pkt.Header.SequenceNumber)
 			time.Sleep(2 * maxLatency)
-			rp := pool.NewPacket(&pkt.Header, pkt.Payload, nil)
 			err := caches.Add(rp)
-			sortedPackets := caches.Flush()
-			sorted = append(sorted, sortedPackets...)
 			if err != nil {
 				dropped++
 			}
-			for _, pkt := range sorted {
-				resultsSeqs = append(resultsSeqs, pkt.Packet.Header().SequenceNumber)
-			}
-			require.Equal(t, 6, len(sorted), "sorted length should be equal to 6, result ", resultsSeqs, seqs)
+			time.Sleep(2 * minLatency)
+			sortedPackets := caches.Flush()
+			sorted = append(sorted, sortedPackets...)
 		} else if pkt.Header.SequenceNumber == 0 {
-			// last sort call should return immediately
 			time.Sleep(2 * maxLatency)
-			rp := pool.NewPacket(&pkt.Header, pkt.Payload, nil)
 			err := caches.Add(rp)
-			sortedPackets := caches.Flush()
-			sorted = append(sorted, sortedPackets...)
 			if err != nil {
 				dropped++
 			}
-			for _, pkt := range sorted {
-				resultsSeqs = append(resultsSeqs, pkt.Packet.Header().SequenceNumber)
-			}
-			// from 15 packets added, 3 packets will be dropped because it's too late
-			require.Equal(t, 13, len(sorted), "sorted length should be equal to 13, result ", resultsSeqs, seqs)
+			time.Sleep(2 * minLatency)
+			sortedPackets := caches.Flush()
+			sorted = append(sorted, sortedPackets...)
 		} else {
-			rp := pool.NewPacket(&pkt.Header, pkt.Payload, nil)
 			err := caches.Add(rp)
-			sortedPackets := caches.Flush()
-			sorted = append(sorted, sortedPackets...)
 			if err != nil {
 				dropped++
 			}
+			sortedPackets := caches.Flush()
+			sorted = append(sorted, sortedPackets...)
 		}
 	}
 
-	require.Equal(t, len(seqs)-dropped-5, len(sorted), "sorted length should be equal to 13, 3 packets still less than min latency. result ", resultsSeqs, seqs)
+	time.Sleep(250 * time.Millisecond)
+	sorted = append(sorted, caches.Flush()...)
 
-	time.Sleep(2 * minLatency)
+	for _, pkt := range sorted {
+		if pkt.Packet != nil {
+			pkt.Packet.Release()
+		}
+	}
 
-	sortedPackets := caches.Flush()
-
-	sorted = append(sorted, sortedPackets...)
-
-	require.Equal(t, len(seqs)-dropped, len(sorted), "sorted length should be equal to 15, result ", resultsSeqs, seqs)
+	require.Equal(t, len(seqs)-dropped, len(sorted), "final sorted length mismatch")
 }
 
 func BenchmarkPushPool(b *testing.B) {

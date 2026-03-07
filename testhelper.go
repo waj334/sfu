@@ -26,8 +26,6 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media/oggreader"
 )
 
-var mediaEngine *webrtc.MediaEngine
-
 const (
 	videoFileName        = "./media/output-720p.h264"
 	videoHalfFileName    = "./media/output-360p.h264"
@@ -53,7 +51,7 @@ func GetStaticTracks(ctx, iceConnectedCtx context.Context, streamID string, loop
 	videoTrack, videoDoneChan := GetStaticVideoTrack(ctx, iceConnectedCtx, videoTrackID, streamID, loop, "low")
 	staticTracks = append(staticTracks, videoTrack)
 
-	allDone := make(chan bool)
+	allDone := make(chan bool, 1)
 
 	go func() {
 		trackDone := 0
@@ -124,16 +122,10 @@ func GetStaticVideoTrack(ctx, iceConnectedCtx context.Context, trackID, streamID
 		}
 	}
 
-	done := make(chan bool)
+	done := make(chan bool, 1)
 
 	go func() {
-		<-iceConnectedCtx.Done()
 		// Send our video file frame at a time. Pace our sending so we send it at the same speed it should be played back as.
-		// This isn't required since the video is timestamped, but we will such much higher loss if we send all at once.
-		//
-		// It is important to use a time.Ticker instead of time.Sleep because
-		// * avoids accumulating skew, just calling time.Sleep didn't compensate for the time spent parsing the data
-		// * works around latency issues with Sleep (see https://github.com/golang/go/issues/44343)
 		ticker := time.NewTicker(h264FrameDuration)
 		// this will loop
 		for {
@@ -199,11 +191,9 @@ func GetStaticAudioTrack(ctx, iceConnectedCtx context.Context, trackID, streamID
 		panic(audioTrackErr)
 	}
 
-	done := make(chan bool)
+	done := make(chan bool, 1)
 
 	go func() {
-		<-iceConnectedCtx.Done()
-		// Open a ogg file and start reading using our oggReader
 		// Keep track of last granule, the difference is the amount of samples in the buffer
 		var lastGranule uint64
 
@@ -359,7 +349,7 @@ func AddSimulcastVideoTracks(ctx, iceConnectedCtx context.Context, pc *webrtc.Pe
 }
 
 func GetMediaEngine() *webrtc.MediaEngine {
-	mediaEngine = &webrtc.MediaEngine{}
+	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		panic(err)
 	}
@@ -423,6 +413,7 @@ func CreatePeerPair(ctx context.Context, log logging.LeveledLogger, room *Room, 
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		fmt.Printf("test: %s connection state changed %s\n", peerName, state)
 		if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
 			log.Infof("test: peer connection %s stated changed %s", peerName, state)
 			if client != nil {
@@ -445,12 +436,30 @@ func CreatePeerPair(ctx context.Context, log logging.LeveledLogger, room *Room, 
 	iceConnectedCtx, iceConnectedCtxCancel := context.WithCancel(ctx)
 
 	pc.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
-		if connectionState == webrtc.ICEConnectionStateConnected {
+		if connectionState == webrtc.ICEConnectionStateConnected || connectionState == webrtc.ICEConnectionStateCompleted {
 			iceConnectedCtxCancel()
 		}
 	})
 
-	allDone := make(chan bool)
+	allDone := make(chan bool, 1)
+
+	// add a new client to room
+	// you can also get the client by using r.GetClient(clientID)
+	id := room.CreateClientID()
+	opts := DefaultClientOptions()
+	opts.IceTrickle = isIceTrickle
+
+	client, _ = room.AddClient(id, id, opts)
+
+	pc.OnNegotiationNeeded(func() {
+		log.Infof("test: negotiation needed %s", peerName)
+		if client.state.Load() == ClientStateEnded {
+			log.Infof("test: negotiation canceled because client has ended")
+			return
+		}
+
+		negotiate(pc, client, log, isIceTrickle)
+	})
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		go func() {
@@ -478,6 +487,21 @@ func CreatePeerPair(ctx context.Context, log logging.LeveledLogger, room *Room, 
 		}()
 	})
 
+	if isSimulcast {
+		_ = AddSimulcastVideoTracks(ctx, iceConnectedCtx, pc, GenerateSecureToken(), peerName)
+
+		for _, sender := range pc.GetSenders() {
+			parameters := sender.GetParameters()
+			if parameters.Encodings[0].RID != "" {
+				simulcastI.SetSenderParameters(parameters)
+			}
+		}
+
+	} else {
+		tracks, done = GetStaticTracks(clientContext, iceConnectedCtx, peerName, loop)
+		SetPeerConnectionTracks(clientContext, pc, tracks)
+	}
+
 	go func() {
 		ctxx, cancell := context.WithCancel(clientContext)
 		defer cancell()
@@ -493,39 +517,6 @@ func CreatePeerPair(ctx context.Context, log logging.LeveledLogger, room *Room, 
 			}
 		}
 	}()
-
-	// add a new client to room
-	// you can also get the client by using r.GetClient(clientID)
-	id := room.CreateClientID()
-	opts := DefaultClientOptions()
-	opts.IceTrickle = isIceTrickle
-
-	client, _ = room.AddClient(id, id, opts)
-
-	pc.OnNegotiationNeeded(func() {
-		log.Infof("test: negotiation needed %s", peerName)
-		if client.state.Load() == ClientStateEnded {
-			log.Infof("test: negotiation canceled because client has ended")
-			return
-		}
-
-		negotiate(pc, client, log, isIceTrickle)
-	})
-
-	if isSimulcast {
-		_ = AddSimulcastVideoTracks(ctx, iceConnectedCtx, pc, GenerateSecureToken(), peerName)
-
-		for _, sender := range pc.GetSenders() {
-			parameters := sender.GetParameters()
-			if parameters.Encodings[0].RID != "" {
-				simulcastI.SetSenderParameters(parameters)
-			}
-		}
-
-	} else {
-		tracks, done = GetStaticTracks(clientContext, iceConnectedCtx, peerName, loop)
-		SetPeerConnectionTracks(clientContext, pc, tracks)
-	}
 
 	client.OnTracksAdded(func(addedTracks []ITrack) {
 		setTracks := make(map[string]TrackType, 0)

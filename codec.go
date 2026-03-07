@@ -15,14 +15,14 @@ import (
 )
 
 var (
-	videoRTCPFeedback = []webrtc.RTCPFeedback{{"goog-remb", ""}, {"ccm", "fir"}, {"nack", ""}, {"nack", "pli"}}
+	videoRTCPFeedback = []webrtc.RTCPFeedback{{Type: "goog-remb", Parameter: ""}, {Type: "ccm", Parameter: "fir"}, {Type: "nack", Parameter: ""}, {Type: "nack", Parameter: "pli"}}
 	videoCodecs       = []webrtc.RTPCodecParameters{
 		{
-			RTPCodecCapability: webrtc.RTPCodecCapability{webrtc.MimeTypeVP8, 90000, 0, "", videoRTCPFeedback},
+			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000, Channels: 0, SDPFmtpLine: "", RTCPFeedback: videoRTCPFeedback},
 			PayloadType:        96,
 		},
 		{
-			RTPCodecCapability: webrtc.RTPCodecCapability{webrtc.MimeTypeRTX, 90000, 0, "apt=96", nil},
+			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeRTX, ClockRate: 90000, Channels: 0, SDPFmtpLine: "apt=96", RTCPFeedback: nil},
 			PayloadType:        97,
 		},
 
@@ -158,11 +158,11 @@ var (
 
 	audioCodecs = []webrtc.RTPCodecParameters{
 		{
-			RTPCodecCapability: webrtc.RTPCodecCapability{"audio/red", 48000, 2, "111/111", nil},
+			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: "audio/red", ClockRate: 48000, Channels: 2, SDPFmtpLine: "111/111", RTCPFeedback: nil},
 			PayloadType:        63,
 		},
 		{
-			RTPCodecCapability: webrtc.RTPCodecCapability{webrtc.MimeTypeOpus, 48000, 2, "minptime=10;useinbandfec=1", nil},
+			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2, SDPFmtpLine: "minptime=10;useinbandfec=1", RTCPFeedback: nil},
 			PayloadType:        111,
 		},
 		{

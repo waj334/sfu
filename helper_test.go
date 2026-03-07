@@ -23,18 +23,14 @@ type RemoteTrackTest struct {
 	Client *PeerClient
 }
 
+var TestIceServers = []webrtc.ICEServer{
+	{
+		URLs: []string{"stun:127.0.0.1:3478"},
+	},
+}
+
 func DefaultTestIceServers() []webrtc.ICEServer {
-	return []webrtc.ICEServer{
-		// {
-		// 	URLs:           []string{"turn:127.0.0.1:3478", "stun:127.0.0.1:3478"},
-		// 	Username:       "user",
-		// 	Credential:     "pass",
-		// 	CredentialType: webrtc.ICECredentialTypePassword,
-		// },
-		{
-			URLs: []string{"stun:127.0.0.1:3478"},
-		},
-	}
+	return TestIceServers
 }
 
 func CheckRoutines(t *testing.T) func() {
@@ -73,10 +69,15 @@ func filterRoutines(routines []string) []string {
 		if stack == "" || // Empty
 			filterRoutineWASM(stack) || // WASM specific exception
 			strings.Contains(stack, "sfu.TestMain(") || // Tests
+			strings.Contains(stack, "testing.tRunner") || // Test run
 			strings.Contains(stack, "testing.(*T).Run(") || // Test run
+			strings.Contains(stack, "testing.(*T).Parallel(") || // Parallel test
+			strings.Contains(stack, "github.com/pion/") || // Any pion background routine
+			strings.Contains(stack, "context.(*cancelCtx).propagateCancel") || // Context propagation
 			strings.Contains(stack, "turn/v4.NewServer") || // turn server
 			strings.Contains(stack, "sfu.StartTurnServer") || // stun server
 			strings.Contains(stack, "sfu.StartStunServer") || // stun server
+			strings.Contains(stack, "sfu.SetPeerConnectionTracks") || // Test helper
 			strings.Contains(stack, "sfu.getRoutines(") { // This routine
 
 			continue

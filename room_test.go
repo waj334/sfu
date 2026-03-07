@@ -224,8 +224,11 @@ func TestRoomStats(t *testing.T) {
 		client2.SetTracksSourceType(setTracks)
 	})
 
-	timeout, cancelTimeout := context.WithTimeout(ctx, 0*time.Second)
+	timeout, cancelTimeout := context.WithTimeout(ctx, 60*time.Second)
 	defer cancelTimeout()
+
+	statsTicker := time.NewTicker(1 * time.Second)
+	defer statsTicker.Stop()
 
 Loop:
 	for {
@@ -239,35 +242,41 @@ Loop:
 		case <-done2:
 			peerCount++
 			t.Log("test: pc2 done")
-		default:
+		case <-statsTicker.C:
 			// this will trying to break out after all audio video packets are received
+			if statsGetter1 == nil || statsGetter2 == nil || pc1.PeerConnection == nil || pc2.PeerConnection == nil {
+				continue
+			}
+
+			pc1ReceiverStats := GetReceiverStats(pc1.PeerConnection, statsGetter1)
+			pc1SenderStats := GetSenderStats(pc1.PeerConnection, statsGetter1)
+			pc2ReceiverStats := GetReceiverStats(pc2.PeerConnection, statsGetter2)
+			pc2SenderStats := GetSenderStats(pc2.PeerConnection, statsGetter2)
+
+			currentClientIngressBytes := uint64(0)
+			currentClientEgressBytes := uint64(0)
+
+			for _, stat := range pc1ReceiverStats {
+				currentClientIngressBytes += stat.InboundRTPStreamStats.BytesReceived
+			}
+
+			for _, stat := range pc2ReceiverStats {
+				currentClientIngressBytes += stat.InboundRTPStreamStats.BytesReceived
+			}
+
+			for _, stat := range pc1SenderStats {
+				currentClientEgressBytes += stat.OutboundRTPStreamStats.BytesSent
+			}
+
+			for _, stat := range pc2SenderStats {
+				currentClientEgressBytes += stat.OutboundRTPStreamStats.BytesSent
+			}
+
+			totalClientIngressBytes = currentClientIngressBytes
+			totalClientEgressBytes = currentClientEgressBytes
 
 			if peerCount == 2 {
 				time.Sleep(2 * time.Second)
-				pc1ReceiverStats := GetReceiverStats(pc1.PeerConnection, statsGetter1)
-				pc1SenderStats := GetSenderStats(pc1.PeerConnection, statsGetter1)
-				pc2ReceiverStats := GetReceiverStats(pc2.PeerConnection, statsGetter2)
-				pc2SenderStats := GetSenderStats(pc2.PeerConnection, statsGetter2)
-
-				totalClientIngressBytes = 0
-				totalClientEgressBytes = 0
-
-				for _, stat := range pc1ReceiverStats {
-					totalClientIngressBytes += stat.InboundRTPStreamStats.BytesReceived
-				}
-
-				for _, stat := range pc2ReceiverStats {
-					totalClientIngressBytes += stat.InboundRTPStreamStats.BytesReceived
-				}
-
-				for _, stat := range pc1SenderStats {
-					totalClientEgressBytes += stat.OutboundRTPStreamStats.BytesSent
-				}
-
-				for _, stat := range pc2SenderStats {
-					totalClientEgressBytes += stat.OutboundRTPStreamStats.BytesSent
-				}
-
 				roomStats := testRoom.Stats()
 
 				diffPercentClientIgressRoomBytesSent := (float64(totalClientIngressBytes) - float64(roomStats.BytesEgress)) / float64(totalClientIngressBytes) * 100

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/pion/logging"
+	"github.com/pion/webrtc/v4"
 )
 
 var TestLogger logging.LeveledLogger
@@ -28,10 +29,16 @@ func TestMain(m *testing.M) {
 
 	TestLogger = logging.NewDefaultLoggerFactory().NewLogger("sfu")
 
-	StartStunServer(ctx, "127.0.0.1")
+	_, stunAddr := StartStunServer(ctx, "127.0.0.1", 0)
+
+	TestIceServers = []webrtc.ICEServer{
+		{
+			URLs: []string{"stun:" + stunAddr},
+		},
+	}
 
 	sfuOpts = DefaultOptions()
-	sfuOpts.IceServers = DefaultTestIceServers()
+	sfuOpts.IceServers = TestIceServers
 
 	sfuOpts.SettingEngine.SetIncludeLoopbackCandidate(true)
 

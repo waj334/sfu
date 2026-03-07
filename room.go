@@ -83,7 +83,7 @@ type RoomOptions struct {
 	// Use this to use scalable video coding (SVC) to control the bitrate level of the video
 	QualityLevels []QualityLevel `json:"quality_levels,omitempty"`
 	// Configure the timeout in nanonseconds when the room is empty it will close after the timeout exceeded. Default is 5 minutes
-	EmptyRoomTimeout *time.Duration `json:"empty_room_timeout_ns,ompitempty" example:"300000000000" default:"300000000000"`
+	EmptyRoomTimeout *time.Duration `json:"empty_room_timeout_ns,omitempty" example:"300000000000" default:"300000000000"`
 }
 
 func DefaultRoomOptions() RoomOptions {
@@ -219,12 +219,27 @@ func (r *Room) AddClient(id, name string, opts ClientOptions) (*Client, error) {
 			defer mu.Unlock()
 
 			if initConnection && state == webrtc.PeerConnectionStateConnected && !timeoutReached {
-				connectingChan <- true
-
-				// set to false so we don't send the connectingChan again because no more listener
-				initConnection = false
+				select {
+				case connectingChan <- true:
+					// set to false so we don't send the connectingChan again
+					initConnection = false
+				default:
+				}
 			}
 		})
+
+		// Check current state in case it's already connected
+		if client.PeerConnection().PC().ConnectionState() == webrtc.PeerConnectionStateConnected {
+			mu.Lock()
+			if initConnection && !timeoutReached {
+				select {
+				case connectingChan <- true:
+					initConnection = false
+				default:
+				}
+			}
+			mu.Unlock()
+		}
 
 		select {
 		case <-timeout.Done():
