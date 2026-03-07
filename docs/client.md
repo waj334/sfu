@@ -1,33 +1,66 @@
-# Add and remove client from a room
-To be able to publish or subscribe to a video stream, the client need to join a room first. To do this the client need to register first.
+# Client Lifecycle & Management
 
-## Add a client to the room
-To add a client, you can call `room.AddClient(clientID)` method. The client ID can be any string. The method will return a client object that can be used to publish or subscribe to a video stream.
+A `Client` represents a single participant's connection to the SFU. Once a client joins a room, it can publish media tracks and subscribe to tracks from others.
 
+## Managing Clients in a Room
+
+Clients are added to a room by the server. You can also retrieve or stop clients at any time.
+
+### Adding a Client
 ```go
-// Use the SFU CreateClientID() helper function to generate a unique clientID
-clientID := r.CreateClientID()
-
-// add a new client to room
-// you can also get the client by using r.GetClient(clientID)
 opts := sfu.DefaultClientOptions()
-opts.EnableVoiceDetection = true
-client, err := room.AddClient(clientID, clientID, opts)
-if err != nil {
-    if err == sfu.ErrClientExists {
-        // client already exists
-    } else {
-        // error when adding client
-    }
-}
+client, err := room.AddClient(clientID, clientName, opts)
 ```
 
-## Remove a client from the room
-When you're done with the client and want to disconnect the client from the room, you can stop the client. This will close the connection. All tracks from the client will be unpublished and removed from the room. To stop the client, you do it from the room instance.
-
+### Retrieving a Client
 ```go
-room.StopClient(client.ID())
+// From the room
+client, err := room.GetClient(clientID)
+
+// Or from the SFU manager
+client, err := manager.GetRoom(roomID).GetClient(clientID)
 ```
 
-## Next
-- [Signal negotiation](./signal.md)
+### Stopping a Client
+To disconnect a client and remove all their tracks:
+```go
+room.StopClient(clientID)
+```
+
+## Responding to Client Events
+
+The `Client` struct provides several callbacks to help you manage its state:
+
+### Connection State
+Monitor the health and lifecycle of the WebRTC connection:
+```go
+client.OnConnectionStateChanged(func(state webrtc.PeerConnectionState) {
+    if state == webrtc.PeerConnectionStateConnected {
+        fmt.Println("Client connected!")
+    } else if state == webrtc.PeerConnectionStateDisconnected {
+        fmt.Println("Client disconnected.")
+    }
+})
+```
+
+### Participant Lifecycle
+```go
+// When the client has successfully joined
+client.OnJoined(func() {
+    fmt.Printf("Client %s has joined\n", client.ID())
+})
+
+// When the client has left the room
+client.OnLeft(func() {
+    fmt.Printf("Client %s has left\n", client.ID())
+})
+```
+
+## Track Events
+
+The `Client` object is the primary place to listen for incoming media:
+
+*   `OnTracksAvailable`: Triggered when others in the room publish tracks. Use this to know what you *can* subscribe to.
+*   `OnTracksAdded`: Triggered when the *local* client adds new tracks to its own connection.
+
+For a detailed guide on media, see **[Publishing Media](./publishing-media.md)**.

@@ -1,39 +1,80 @@
-# Create and close a room
-Before a client can publish or subscribe to a video stream, the client need to join a room first. A room is a virtual room where clients can join and publish/subscribe to video streams. A client can only publish/subscribe to video streams from the same room.
+# Room Management
 
-## Create a room
-To create a room, you can call `client.CreateRoom(roomID)` method. The room ID can be any string. The method will return a room object that can be used to add or remove client from the room.
+A `Room` is the primary container for a media session. It manages the collection of clients and their shared media tracks.
 
+## Creating and Closing Rooms
+
+Rooms are managed through the `Manager`. Each room has a unique ID, a name, and a set of options.
+
+### Creating a Room
 ```go
-// create room manager first before create new room
-ctx:= context.Background()
-sfuOpts := sfu.DefaultOptions()
-roomManager := sfu.NewManager(ctx, "server-name-here", sfuOpts)
+manager := sfu.NewManager(ctx, "my-server", opts)
 
-// generate a new room id. 
-roomID := roomManager.CreateRoomID()
-roomName := "test-room"
+roomID := manager.CreateRoomID()
+roomName := "my-awesome-room"
+roomType := sfu.RoomTypeLocal
 
-// create new room
-roomsOpts := sfu.DefaultRoomOptions()
-room, _ := roomManager.NewRoom(roomID, roomName, sfu.RoomTypeLocal, roomsOpts)
+roomOpts := sfu.DefaultRoomOptions()
+room, err := manager.NewRoom(roomID, roomName, roomType, roomOpts)
 ```
 
-## Close a room
-When you're done with the room and want to disconnect all the participants in the room, you can close the room. This will stop all clients in the room. All tracks will also remove from the room before close the room. To close the room, you can do it either from room manager or directly from the room instance.
-
+### Finding an Existing Room
 ```go
-// close room from room manager
-roomManager.CloseRoom(roomID)
+room, err := manager.GetRoom(roomID)
 ```
 
-The code above similar with this code below:
-
+### Closing a Room
+Closing a room will stop all clients and clean up all media tracks.
 ```go
-if room,err:= roomManager.GetRoom(roomID);err!=nil{
-    room.Close()
-}
+// From the manager
+manager.CloseRoom(roomID)
+
+// Directly from the room instance
+room.Close()
 ```
 
-## Next
-- [Add and remove client from room](./client.md)
+## Room Metadata & Properties
+
+Rooms can store metadata that is shared across all participants. This is useful for synchronization or simply for descriptive purposes.
+
+```go
+// Setting metadata
+room.Meta().Set("topic", "Project Update")
+
+// Getting properties
+fmt.Println("Room Name:", room.Name())
+fmt.Println("Room Type:", room.Kind())
+```
+
+## Monitoring Room State
+
+You can listen for events at the room level to react to changes in the session:
+
+```go
+// When any client joins the room
+room.OnClientJoined(func(client *sfu.Client) {
+    fmt.Printf("New participant: %s\n", client.Name())
+})
+
+// When any client leaves the room
+room.OnClientLeft(func(client *sfu.Client) {
+    fmt.Printf("Participant left: %s\n", client.Name())
+})
+
+// When the entire room is closed
+room.OnRoomClosed(func(id string) {
+    fmt.Printf("Room %s has been terminated\n", id)
+})
+```
+
+## Global Statistics
+
+To monitor the health and usage of an entire room, you can retrieve global stats:
+
+```go
+stats := room.Stats()
+fmt.Printf("Active Clients: %d\n", stats.ActiveClients)
+fmt.Printf("Total Tracks: %d\n", stats.TotalTracks)
+```
+
+For more detailed telemetry, see the **[Observability & Smart UIs](./observability.md)** guide.

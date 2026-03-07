@@ -1,25 +1,37 @@
-# Documentation
-This documentation is about mandatories functionality that part of the SFU. You can learn how we implement the feature from each documentation and how to use it in your own app. 
+# Getting Started with inLive SFU
 
-## Glossary
-- **SFU**: Selective Forwarding Unit. A server that receives a video stream from a client and forwards it to other clients. The SFU can choose which video stream to forward to other clients.
-- **Client**: A client that connects to the SFU. The client can publish a video stream and subscribe to other video streams.
-- **Publisher**: A client that publishes a video stream to the SFU.
-- **Subscriber**: A client that subscribes to a video stream from the SFU.
-- **Track**: An audio/video stream that published by the client. A client can publish multiple tracks.
-- **Room** A virtual room where clients can join and publish/subscribe to video streams. A client can only publish/subscribe to video streams from the same room.
+inLive SFU is designed to be a high-performance, developer-friendly Selective Forwarding Unit for building real-time communication applications. This guide will help you understand the core concepts and how to use the package effectively.
 
+## Core Concepts & Hierarchy
 
-## How it works
-The SFU basic function is to receive media stream from a client and forward it to other clients. There is a mechanism in SFU that optimizing how the stream is forwarded to other clients to make sure the receiver clients can play the stream smoothly. 
+To build an app with this package, it's important to understand how the components relate to each other:
 
-## Documentation
-- [Create and remove room](./room.md)
-- [Add and remove client from room](./client.md)
-- [Signal negotiation](./signal.md)
-- [Publishing simulcast video](./simulcast.md)
-- [Publishing scalable video codec(SVC)](./svc.md)
-- [Subscribe and view video](./video-subscription.md)
-- [Send receive message through data channel](./data-channel.md)
-- [Voice activity detection](./vad.md)
-- [Statistics](./statistics.md)
+1.  **Manager**: The root component. It manages multiple rooms and provides global configuration.
+2.  **Room**: A virtual space where media is shared. Clients in the same room can discover and subscribe to each other's tracks.
+3.  **Client**: Represents a single participant (peer connection) in a room. A client can both publish and subscribe to media.
+4.  **Track**: The actual media stream (audio or video). A client publishes local tracks and subscribes to remote tracks from other clients.
+
+## Development Guides
+
+Follow these guides to learn how to implement specific features and patterns:
+
+### 1. Patterns & Examples
+*   **[Use Cases](./use-cases.md)**: (New) Implementation patterns for Live Streaming vs. Video Conferencing.
+
+### 2. Fundamentals
+*   **[Room Management](./room.md)**: How to create, find, and close rooms using the Manager.
+*   **[Client Lifecycle](./client.md)**: Adding and removing clients from rooms.
+*   **[Signaling & Negotiation](./signal.md)**: Understanding the WebRTC offer/answer flow and dynamic renegotiation.
+
+### 2. Media Strategies
+*   **[Publishing Media](./publishing-media.md)**: Technical "how-to" for Simulcast, SVC, and RED.
+*   **[Video Quality Strategies](./video-strategies.md)**: (New) High-level strategies for ResizeObserver and IntersectionObserver.
+*   **[Video Subscription](./video-subscription.md)**: How to discover and subscribe to remote tracks.
+
+### 3. Real-time Interactivity
+*   **[Data Channels](./data-channels.md)**: (New) Using data channels for low-latency messaging and custom signaling.
+*   **[Observability & Smart UIs](./observability.md)**: (New) Implementing Active Speaker Detection (VAD) and Network Quality indicators.
+
+### 4. Advanced Customization
+*   **[Extending the SFU](./extension.md)**: Hooking into internal events with the Extension system.
+*   **[Network Reliability](./network-reliability.md)**: (Updated) Understanding NACK, RED, and FEC.
