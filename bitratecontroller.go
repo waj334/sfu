@@ -231,37 +231,14 @@ func (bc *bitrateController) addStaticVideoClaims(clientTracks []iClientTrack) (
 }
 
 // calculate the quality level for each track based on the available bandwidth and max bitrate of tracks
-// maxReceiveBitrate is the largest bitrate being received for any of the given
-// tracks: the cost of forwarding the widest one of them.
-//
-// The bitrate compared has to be the one assigned, and it has to be the
-// received one. The comparison used to read SendBitrate while the assignment
-// took ReceiveBitrate, which broke it twice over. Every caller reaches here
-// from addClaims with tracks that have only just been subscribed, so nothing
-// has been sent on them yet and SendBitrate is 0 for all of them — the
-// comparison was 0 > 0 on every pass and maxBitrate never left zero, which
-// left qualityLevelPerTrack returning QualityHigh whenever any bandwidth
-// remained and QualityLowLow when none did, with the three levels between them
-// unreachable. Mixing the two metrics also meant the running value was not a
-// maximum of anything, so a later, smaller track could lower it.
-//
-// Received is the right side of it: what a track costs to forward is what has
-// to fit in the bandwidth left, and the bandwidth left is itself worked out
-// from totalReceivedBitrates.
-func maxReceiveBitrate(clientTracks []iClientTrack) uint32 {
+func (bc *bitrateController) qualityLevelPerTrack(clientTracks []iClientTrack) QualityLevel {
 	maxBitrate := uint32(0)
 
 	for _, clientTrack := range clientTracks {
-		if bitrate := clientTrack.ReceiveBitrate(); bitrate > maxBitrate {
-			maxBitrate = bitrate
+		if clientTrack.SendBitrate() > maxBitrate {
+			maxBitrate = clientTrack.ReceiveBitrate()
 		}
 	}
-
-	return maxBitrate
-}
-
-func (bc *bitrateController) qualityLevelPerTrack(clientTracks []iClientTrack) QualityLevel {
-	maxBitrate := maxReceiveBitrate(clientTracks)
 
 	bw := bc.client.GetEstimatedBandwidth()
 
