@@ -7,14 +7,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/inlivedev/sfu/pkg/interceptors/voiceactivedetector"
-	"github.com/inlivedev/sfu/pkg/networkmonitor"
-	"github.com/inlivedev/sfu/pkg/rtppool"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/stats"
 	"github.com/pion/logging"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
+	"github.com/waj334/sfu/pkg/interceptors/voiceactivedetector"
+	"github.com/waj334/sfu/pkg/networkmonitor"
+	"github.com/waj334/sfu/pkg/rtppool"
 )
 
 const (

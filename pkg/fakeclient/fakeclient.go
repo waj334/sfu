@@ -3,10 +3,10 @@ package fakeclient
 import (
 	"context"
 
-	"github.com/inlivedev/sfu"
 	"github.com/pion/interceptor/pkg/stats"
 	"github.com/pion/logging"
 	"github.com/pion/webrtc/v4"
+	"github.com/waj334/sfu"
 )
 
 type FakeClient struct {

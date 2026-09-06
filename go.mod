@@ -1,4 +1,4 @@
-module github.com/inlivedev/sfu
+module github.com/waj334/sfu
 
 go 1.23
 

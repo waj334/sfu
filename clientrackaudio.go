@@ -1,8 +1,8 @@
 package sfu
 
 import (
-	"github.com/inlivedev/sfu/pkg/interceptors/voiceactivedetector"
 	"github.com/pion/webrtc/v4"
+	"github.com/waj334/sfu/pkg/interceptors/voiceactivedetector"
 )
 
 type clientTrackAudio struct {
