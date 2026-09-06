@@ -371,7 +371,12 @@ func (bc *bitrateController) addClaim(clientTrack iClientTrack, quality QualityL
 
 func (bc *bitrateController) removeClaim(id string) {
 	if _, exist := bc.claims.LoadAndDelete(id); !exist {
-		bc.log.Errorf("bitrate: track %s is not exists", id)
+		// Named apart from the viewed-size case below, which reported the same
+		// sentence for an unrelated condition and made the two impossible to
+		// tell apart in a log. The client is named because one client dropping
+		// a claim twice and two clients dropping it once each read identically
+		// without it.
+		bc.log.Errorf("bitrate: client %s has no claim to remove for track %s", bc.client.ID(), id)
 	}
 }
 
@@ -572,7 +577,18 @@ func (bc *bitrateController) getPrevQuality(quality QualityLevel) QualityLevel {
 func (bc *bitrateController) onRemoteViewedSizeChanged(videoSize videoSize) {
 	val, ok := bc.claims.Load(videoSize.TrackID)
 	if !ok {
-		bc.log.Errorf("bitrate: track %s is not exists", videoSize.TrackID)
+		// The tracks it does hold are the useful half. An empty list means the
+		// report simply arrived before the claim did; a list that holds other
+		// ids means the client is naming a track this side does not know under
+		// that name, which is a different fault entirely.
+		held := make([]string, 0)
+		bc.claims.Range(func(key, _ any) bool {
+			held = append(held, key.(string))
+			return true
+		})
+
+		bc.log.Errorf("bitrate: client %s reported a viewed size for track %s it holds no claim on; claims held: %v",
+			bc.client.ID(), videoSize.TrackID, held)
 		return
 	}
 
