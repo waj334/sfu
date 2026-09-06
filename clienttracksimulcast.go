@@ -28,6 +28,11 @@ type simulcastClientTrack struct {
 	paddingTS               *atomic.Uint32
 	maxQuality              *atomic.Uint32
 	lastTimestamp           *atomic.Uint32
+	rewriteMu               sync.Mutex
+	clockRate               uint32
+	timestampOffset         *atomic.Uint32
+	lastSentTimestamp       *atomic.Uint32
+	lastSentQuality         *atomic.Uint32
 	isScreen                *atomic.Bool
 	isEnded                 *atomic.Bool
 	packetmapHigh           *packetmap.Map
@@ -70,6 +75,10 @@ func newSimulcastClientTrack(c *Client, t *SimulcastTrack) *simulcastClientTrack
 		maxQuality:              &atomic.Uint32{},
 		lastBlankSequenceNumber: &atomic.Uint32{},
 		lastTimestamp:           lastTimestamp,
+		clockRate:               track.Codec().ClockRate,
+		timestampOffset:         &atomic.Uint32{},
+		lastSentTimestamp:       &atomic.Uint32{},
+		lastSentQuality:         &atomic.Uint32{},
 		isScreen:                isScreen,
 		isEnded:                 &atomic.Bool{},
 		onTrackEndedCallbacks:   make([]func(), 0),
@@ -308,26 +317,83 @@ func (t *simulcastClientTrack) IsScaleable() bool {
 	return false
 }
 
+// rewritePacket puts a packet on the timeline this subscriber has been watching,
+// whichever simulcast layer it arrived on.
+//
+// Every layer is a separate RTP stream with its own randomly chosen sequence
+// number and timestamp base, so neither number can be forwarded as it stands.
+// Both are carried by counters of this track's own, and both are stepped on at
+// the moment the forwarded layer changes: the sequence number by one packet,
+// and the timestamp by one frame, placing the first frame of the new layer
+// immediately after the last frame of the old one. Off a switch they follow
+// whatever the source layer did.
+//
+// The offset used to be a fixed anchor recorded per layer instead, which made a
+// switch move the timeline by the difference between two unrelated random
+// numbers — typically minutes, far outside the ten seconds a receiver will hold
+// a frame for. libwebrtc threw the frame away ("bad render timing"), reset its
+// jitter estimator, and the picture froze until it had rebuilt one. Anchoring
+// per layer cannot fix that on its own either: a layer the publisher only
+// starts sending once bandwidth allows records its base late, and switching to
+// it then rewinds the timeline by however late it was.
 func (t *simulcastClientTrack) rewritePacket(p *rtp.Packet, quality QualityLevel) {
+	// Packets arrive from one goroutine per layer, and a switch is exactly the
+	// moment two of them are live at once. The offset, the last timestamp sent
+	// and the layer it belonged to only mean anything together, so they move
+	// together. The lock is this track's alone and is uncontended off a switch.
+	t.rewriteMu.Lock()
+	defer t.rewriteMu.Unlock()
+
 	t.remoteTrack.mu.RLock()
-	defer t.remoteTrack.mu.RUnlock()
-	// make sure the timestamp and sequence number is consistent from the previous packet even it is not the same track
 	sequenceDelta := uint16(0)
-	// credit to https://github.com/k0nserv for helping me with this on Pion Slack channel
 	switch quality {
 	case QualityHigh:
-		p.Timestamp = t.remoteTrack.baseTS + ((p.Timestamp - t.remoteTrack.remoteTrackHighBaseTS) - t.remoteTrack.remoteTrackHighBaseTS)
 		sequenceDelta = t.remoteTrack.highSequence - t.remoteTrack.lastHighSequence
 	case QualityMid:
-		p.Timestamp = t.remoteTrack.baseTS + ((p.Timestamp - t.remoteTrack.remoteTrackMidBaseTS) - t.remoteTrack.remoteTrackMidBaseTS)
 		sequenceDelta = t.remoteTrack.midSequence - t.remoteTrack.lastMidSequence
 	case QualityLow:
-		p.Timestamp = t.remoteTrack.baseTS + ((p.Timestamp - t.remoteTrack.remoteTrackLowBaseTS) - t.remoteTrack.remoteTrackLowBaseTS)
 		sequenceDelta = t.remoteTrack.lowSequence - t.remoteTrack.lastLowSequence
 	}
+	t.remoteTrack.mu.RUnlock()
 
-	t.sequenceNumber.Add(uint32(sequenceDelta))
+	if previous := Uint32ToQualityLevel(t.lastSentQuality.Load()); previous != QualityNone && previous != quality {
+		// A switch lands on a keyframe, so this packet opens the frame after the
+		// last one sent and follows the last packet sent. A nominal frame is
+		// close enough to place it, because the receiver reads the interval as
+		// jitter rather than as a duration.
+		//
+		// The step of one matters as much as the offset does. The layer's own
+		// gap is meaningless here — against a layer being read for the first
+		// time it is the whole of that layer's starting sequence number, which
+		// reads downstream as tens of thousands of packets lost at once.
+		t.timestampOffset.Store(t.lastSentTimestamp.Load() + t.frameDuration() - p.Timestamp)
+		t.sequenceNumber.Add(1)
+	} else {
+		// Within a layer the gap is real and is carried through, so a packet
+		// lost on the way in stays lost and the subscriber can ask for it back.
+		// The first packet of all lands here too: the timeline starts wherever
+		// it happens to start, and nothing has been sent for it to disagree with.
+		t.sequenceNumber.Add(uint32(sequenceDelta))
+	}
+
+	p.Timestamp += t.timestampOffset.Load()
 	p.SequenceNumber = uint16(t.sequenceNumber.Load())
+
+	t.lastSentTimestamp.Store(p.Timestamp)
+	t.lastSentQuality.Store(uint32(quality))
+}
+
+// frameDuration is one frame at the track's clock, in RTP timestamp units.
+//
+// Nominal thirty a second. Nothing here knows the publisher's real frame rate,
+// and it only has to be close: the number is used once per layer switch to
+// leave a gap where the next frame would have been.
+func (t *simulcastClientTrack) frameDuration() uint32 {
+	if t.clockRate == 0 {
+		return 0
+	}
+
+	return t.clockRate / 30
 }
 
 func (t *simulcastClientTrack) RequestPLI() {
