@@ -407,6 +407,7 @@ type SimulcastTrack struct {
 	onNetworkConditionChanged   func(networkmonitor.NetworkConditionType)
 	reordered                   bool
 	onEndedCallbacks            []func()
+	isEnded                     *atomic.Bool
 }
 
 func newSimulcastTrack(client *Client, track IRemoteTrack, minWait, maxWait, pliInterval time.Duration, onPLI func(), stats stats.Getter, onStatsUpdated func(*stats.Stats)) ITrack {
@@ -438,6 +439,7 @@ func newSimulcastTrack(client *Client, track IRemoteTrack, minWait, maxWait, pli
 			client.onNetworkConditionChanged(condition)
 		},
 		onEndedCallbacks: make([]func(), 0),
+		isEnded:          &atomic.Bool{},
 	}
 
 	t.context, t.cancel = context.WithCancel(client.Context())
@@ -903,8 +905,33 @@ func (t *SimulcastTrack) OnEnded(f func()) {
 	t.onEndedCallbacks = append(t.onEndedCallbacks, f)
 }
 
+// onEnded runs the ended callbacks exactly once.
+//
+// A simulcast track has a read loop per layer, and each one calls this on its
+// way out — the first to finish cancels the track's context, which is what
+// makes the other two exit. So without the guard every subscriber's ended
+// handling ran once per layer: the bitrate claim was removed three times
+// (twice against an already-empty map, which logged an error), and the sender
+// was removed from the peer connection three times, marking renegotiation
+// needed on each of the redundant ones.
+//
+// The compare-and-swap is what makes it once rather than nearly-once. The
+// layers end together, so a load-then-store guard is read by all three before
+// any of them has stored.
+//
+// The callbacks are copied out rather than called under the lock: they run
+// arbitrary subscriber code, which takes locks of its own.
 func (t *SimulcastTrack) onEnded() {
-	for _, f := range t.onEndedCallbacks {
+	if !t.isEnded.CompareAndSwap(false, true) {
+		return
+	}
+
+	t.mu.RLock()
+	callbacks := make([]func(), len(t.onEndedCallbacks))
+	copy(callbacks, t.onEndedCallbacks)
+	t.mu.RUnlock()
+
+	for _, f := range callbacks {
 		f()
 	}
 }

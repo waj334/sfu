@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 
@@ -258,16 +259,29 @@ func (t *simulcastClientTrack) OnEnded(callback func()) {
 	t.onTrackEndedCallbacks = append(t.onTrackEndedCallbacks, callback)
 }
 
+// onEnded runs the ended callbacks exactly once.
+//
+// Guarded by a compare-and-swap rather than a load followed by a store: the
+// store used to happen after the callbacks had run, so concurrent callers all
+// read false and all ran them. SimulcastTrack.onEnded is the caller and now
+// fires once, but this track is reachable from a track replacement as well, so
+// the guard has to hold on its own.
+//
+// The callbacks are copied out under the lock that OnEnded appends beneath,
+// and called outside it — they reach back into the client.
 func (t *simulcastClientTrack) onEnded() {
-	if t.isEnded.Load() {
+	if !t.isEnded.CompareAndSwap(false, true) {
 		return
 	}
 
-	for _, callback := range t.onTrackEndedCallbacks {
+	t.mu.RLock()
+	callbacks := make([]func(), len(t.onTrackEndedCallbacks))
+	copy(callbacks, t.onTrackEndedCallbacks)
+	t.mu.RUnlock()
+
+	for _, callback := range callbacks {
 		callback()
 	}
-
-	t.isEnded.Store(true)
 }
 
 func (t *simulcastClientTrack) SetMaxQuality(quality QualityLevel) {
@@ -361,7 +375,16 @@ func (t *simulcastClientTrack) ReceiveBitrate() uint32 {
 func (t *simulcastClientTrack) SendBitrate() uint32 {
 	bitrate, err := t.client.stats.GetSenderBitrate(t.ID())
 	if err != nil {
-		t.client.log.Errorf("clienttrack: error on get sender", err)
+		// Missing stats are the ordinary case for the first second of a
+		// subscription: the sender stats are written by a one-second ticker, and
+		// addClaims asks for the bitrate before that has ever run. clientTrack
+		// already skipped it here; this path did not, and logged it at error on
+		// every subscribe — through a format string with no verb for the error,
+		// which is where the "%!(EXTRA ...)" in the log came from.
+		if !errors.Is(err, ErrCLientStatsNotFound) {
+			t.client.log.Errorf("clienttrack: error on get sender bitrate %s", err.Error())
+		}
+
 		return 0
 	}
 
