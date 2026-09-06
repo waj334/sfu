@@ -4,8 +4,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v4"
 	"github.com/stretchr/testify/require"
 )
 
@@ -20,6 +22,8 @@ func newRewriteTestTrack(published *SimulcastTrack) *simulcastClientTrack {
 		timestampOffset:   &atomic.Uint32{},
 		lastSentTimestamp: &atomic.Uint32{},
 		lastSentQuality:   &atomic.Uint32{},
+		lastForwardedAt:   &atomic.Int64{},
+		forwardedQuality:  &atomic.Uint32{},
 	}
 }
 
@@ -172,5 +176,114 @@ func TestSimulcastRewriteSurvivesRepeatedSwitches(t *testing.T) {
 				timestamps[level] += frame
 			}
 		}
+	}
+}
+
+// Every rung of the bitrate ladder has to name a layer that is actually on the
+// wire. The rungs below QualityLow are not a fourth simulcast stream — they are
+// the low layer with the publisher asked for less — and reading them as a layer
+// to forward means never matching any arriving packet, so nothing is forwarded
+// at all.
+func TestLayerForResolvesEveryLadderRungToALayer(t *testing.T) {
+	for quality, want := range map[QualityLevel]QualityLevel{
+		QualityHigh:    QualityHigh,
+		QualityHighMid: QualityHigh,
+		QualityHighLow: QualityHigh,
+		QualityMid:     QualityMid,
+		QualityMidMid:  QualityMid,
+		QualityMidLow:  QualityMid,
+		QualityLow:     QualityLow,
+		QualityLowMid:  QualityLow,
+		QualityLowLow:  QualityLow,
+	} {
+		require.Equal(t, want, layerFor(quality), "rung %d", quality)
+	}
+
+	// Audio and "none" name no video layer, and must not be read as one.
+	// Written through QualityLevel because the rungs are untyped constants.
+	for _, quality := range []QualityLevel{QualityNone, QualityAudio, QualityAudioRed} {
+		require.Equal(t, QualityLevel(QualityNone), layerFor(quality), "rung %d", quality)
+	}
+}
+
+// The layer on a subscriber's track may only change where a decoder can pick the
+// stream up: the first packet of a keyframe of the layer being moved to. Every
+// other packet leaves it where it is, whatever the bitrate controller wants,
+// because a decoder handed the middle of another encoder's stream has none of
+// the reference frames it names.
+func TestForwardingOnlyStartsOnAKeyframeOfTheWantedLayer(t *testing.T) {
+	const (
+		keyframe = true
+		delta    = false
+		mapped   = true
+		dropped  = false
+	)
+
+	require.True(t, canStartForwarding(QualityLow, QualityHigh, QualityHigh, keyframe, mapped),
+		"a mapped keyframe of the wanted layer is the one place a switch may happen")
+
+	// Nothing is being forwarded yet. The track still starts on a keyframe.
+	require.True(t, canStartForwarding(QualityNone, QualityLow, QualityLow, keyframe, mapped))
+	require.False(t, canStartForwarding(QualityNone, QualityLow, QualityLow, delta, mapped),
+		"the first packet of all is not an excuse to start mid-frame")
+
+	require.False(t, canStartForwarding(QualityLow, QualityHigh, QualityHigh, delta, mapped),
+		"a delta frame of the wanted layer references frames the viewer has never seen")
+	require.False(t, canStartForwarding(QualityLow, QualityHigh, QualityMid, keyframe, mapped),
+		"a keyframe of a layer nobody asked for is not a switch")
+	require.False(t, canStartForwarding(QualityLow, QualityHigh, QualityHigh, keyframe, dropped),
+		"a keyframe the sequence map will not carry cannot be switched on")
+	require.False(t, canStartForwarding(QualityHigh, QualityHigh, QualityHigh, keyframe, mapped),
+		"already forwarding the wanted layer; a keyframe changes nothing")
+}
+
+// The wait for the new layer's keyframe is time the viewer spent on the old
+// layer's last frame. Charging one nominal frame for it instead tells the
+// receiver every frame after the switch arrived late, and its jitter estimate
+// grows by the difference.
+func TestSwitchGapChargesTheRealWait(t *testing.T) {
+	published := &SimulcastTrack{mu: sync.RWMutex{}}
+	subscriber := newRewriteTestTrack(published)
+
+	now := time.Now()
+	subscriber.clock = func() time.Time { return now }
+
+	// Nothing forwarded yet, so there is no wait to charge for.
+	require.Equal(t, uint32(3000), subscriber.switchGap())
+
+	subscriber.lastForwardedAt.Store(now.Add(-800 * time.Millisecond).UnixNano())
+	require.Equal(t, uint32(0.8*90000), subscriber.switchGap())
+
+	// A switch that lands inside a frame of the packet before it still has to
+	// move the clock forward.
+	subscriber.lastForwardedAt.Store(now.Add(-1 * time.Millisecond).UnixNano())
+	require.Equal(t, uint32(3000), subscriber.switchGap())
+
+	// A track resumed after long enough would overflow the arithmetic.
+	subscriber.lastForwardedAt.Store(now.Add(-72 * time.Hour).UnixNano())
+	require.Equal(t, uint32(maxSwitchGap.Seconds()*90000), subscriber.switchGap())
+}
+
+// The keyframe gate is only safe for codecs whose keyframes this library can
+// actually recognise. Keyframe answers "no" to every packet of a codec it does
+// not know, so gating on it there would produce a subscriber that never starts.
+func TestKeyframeGateOnlyAppliesToCodecsItCanRead(t *testing.T) {
+	for _, mimeType := range []string{
+		webrtc.MimeTypeVP8,
+		webrtc.MimeTypeVP9,
+		webrtc.MimeTypeAV1,
+		webrtc.MimeTypeH264,
+		"VIDEO/VP8", // the comparison is case insensitive, as SDP is
+	} {
+		require.True(t, detectsKeyframes(mimeType), mimeType)
+	}
+
+	for _, mimeType := range []string{
+		webrtc.MimeTypeH265,
+		webrtc.MimeTypeOpus,
+		"video/some-codec-from-the-future",
+		"",
+	} {
+		require.False(t, detectsKeyframes(mimeType), mimeType)
 	}
 }

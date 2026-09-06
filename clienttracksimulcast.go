@@ -3,8 +3,10 @@ package sfu
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -33,6 +35,10 @@ type simulcastClientTrack struct {
 	timestampOffset         *atomic.Uint32
 	lastSentTimestamp       *atomic.Uint32
 	lastSentQuality         *atomic.Uint32
+	lastForwardedAt         *atomic.Int64
+	forwardedQuality        *atomic.Uint32
+	detectsKeyframes        bool
+	clock                   func() time.Time
 	isScreen                *atomic.Bool
 	isEnded                 *atomic.Bool
 	packetmapHigh           *packetmap.Map
@@ -79,6 +85,9 @@ func newSimulcastClientTrack(c *Client, t *SimulcastTrack) *simulcastClientTrack
 		timestampOffset:         &atomic.Uint32{},
 		lastSentTimestamp:       &atomic.Uint32{},
 		lastSentQuality:         &atomic.Uint32{},
+		lastForwardedAt:         &atomic.Int64{},
+		forwardedQuality:        &atomic.Uint32{},
+		detectsKeyframes:        detectsKeyframes(track.Codec().MimeType),
 		isScreen:                isScreen,
 		isEnded:                 &atomic.Bool{},
 		onTrackEndedCallbacks:   make([]func(), 0),
@@ -90,6 +99,14 @@ func newSimulcastClientTrack(c *Client, t *SimulcastTrack) *simulcastClientTrack
 	ct.SetMaxQuality(QualityHigh)
 
 	ct.remoteTrack.sendPLI()
+
+	// A layer that turns up later is one this subscriber may want to move onto,
+	// and it can only move on a keyframe. Registered once here rather than on
+	// the first packet forwarded, which is where it used to live and so never
+	// ran for a track whose first packet had not arrived yet.
+	ct.remoteTrack.onRemoteTrackAdded(func(remote *remoteTrack) {
+		ct.remoteTrack.sendPLI()
+	})
 
 	t.OnEnded(func() {
 		ct.onEnded()
@@ -131,68 +148,127 @@ func (t *simulcastClientTrack) writeRTP(p *rtp.Packet) {
 	}
 }
 
-func (t *simulcastClientTrack) push(p *rtp.Packet, quality QualityLevel) {
-	isKeyframe := IsKeyframe(t.mimeType, p.Payload)
-
-	currentQuality := t.LastQuality()
-
-	targetQuality := t.getQuality()
-
-	if targetQuality == QualityNone {
-		// TODO: figure out what to do if the target quality is none
-		// probably we should send a blank frame
-		targetQuality = QualityLow
+// layerFor names the simulcast layer that carries a rung of the bitrate ladder.
+//
+// The ladder is finer than simulcast is. Below the low layer it keeps going,
+// with rungs that mean "the low layer, and ask the publisher for less" rather
+// than a fourth stream to forward, so every rung still has to resolve to one of
+// the three layers that exist on the wire.
+func layerFor(quality QualityLevel) QualityLevel {
+	switch quality {
+	case QualityHigh, QualityHighMid, QualityHighLow:
+		return QualityHigh
+	case QualityMid, QualityMidMid, QualityMidLow:
+		return QualityMid
+	case QualityLow, QualityLowMid, QualityLowLow:
+		return QualityLow
 	}
 
+	return QualityNone
+}
+
+// detectsKeyframes reports whether [Keyframe] can read this codec.
+//
+// For anything else it answers "not a keyframe" to every packet it is ever
+// given, and a keyframe gate built on that would never open. Every codec this
+// library registers for video is here; the check exists so that one which is
+// not cannot silently produce a subscriber that receives nothing at all.
+func detectsKeyframes(mimeType string) bool {
+	for _, known := range []string{
+		webrtc.MimeTypeVP8,
+		webrtc.MimeTypeVP9,
+		webrtc.MimeTypeAV1,
+		webrtc.MimeTypeH264,
+	} {
+		if strings.EqualFold(mimeType, known) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// canStartForwarding reports whether a packet is a point at which the layer on
+// this subscriber's track may change.
+//
+// Every condition has to hold at once. The layer being forwarded has to differ
+// from the one wanted, or there is nothing to do; the packet has to belong to
+// the layer wanted, or it is not the one to switch on; and it has to open a
+// keyframe that the sequence map will carry, because that is the only kind of
+// frame a decoder can start on without the frames before it.
+func canStartForwarding(forwarding, target, quality QualityLevel, isKeyframe, mapped bool) bool {
+	return forwarding != target && quality == target && isKeyframe && mapped
+}
+
+// push offers a packet from one simulcast layer to this subscriber.
+//
+// One layer is on the subscriber's track at a time, and which one may only
+// change at the first packet of a keyframe. A decoder handed the middle of
+// another encoder's stream has none of the reference frames it names and paints
+// the difference — the torn, blocky picture that arrived at random and stayed
+// until something else happened to force a keyframe.
+//
+// So the layer being forwarded is kept apart from the layer that is wanted.
+// What is wanted moves the moment the bitrate controller says so, or the moment
+// the layer being forwarded goes quiet. What is being forwarded follows only
+// once the publisher has produced a keyframe to switch on, and the old layer
+// keeps playing until it does.
+//
+// Before this, the two were the same value, and it was read through
+// LastQuality, which reports the low layer whenever the layer it was told to
+// use has not been read from in 500ms. A publisher pausing its top layer — which
+// libwebrtc does routinely under CPU or bandwidth pressure — therefore switched
+// the subscriber onto the low layer at whatever packet happened to arrive next.
+func (t *simulcastClientTrack) push(p *rtp.Packet, quality QualityLevel) {
 	if !t.client.bitrateController.Exist(t.ID()) {
 		// do nothing if the bitrate claim is not exist
 		return
 	}
 
-	var canSwitch bool
+	forwarding := Uint32ToQualityLevel(t.forwardedQuality.Load())
 
-	switch quality {
-	case QualityHigh:
-		canSwitch, _, _ = t.packetmapHigh.Map(p.SequenceNumber, 0)
-	case QualityMid:
-		canSwitch, _, _ = t.packetmapMid.Map(p.SequenceNumber, 0)
-	case QualityLow:
-		canSwitch, _, _ = t.packetmapLow.Map(p.SequenceNumber, 0)
+	// getQuality steps off a layer the publisher has stopped sending on its own,
+	// so this is a layer that exists and not merely one that is wanted.
+	target := layerFor(t.getQuality())
+	if target == QualityNone {
+		// TODO: figure out what to do if the target quality is none
+		// probably we should send a blank frame
+		target = QualityLow
 	}
 
-	// check if it's a first packet to send
-	if currentQuality == QualityNone && t.sequenceNumber.Load() == 0 {
-		// we try to send the low quality first	if the track is active and fallback to upper quality if not
-		if t.remoteTrack.GetRemoteTrack(QualityLow) != nil && quality == QualityLow {
-			t.lastQuality.Store(uint32(QualityLow))
-			// send PLI to make sure the client will receive the first frame
-			t.remoteTrack.sendPLI()
-		} else if t.remoteTrack.GetRemoteTrack(QualityMid) != nil && quality == QualityMid {
-			t.lastQuality.Store(uint32(QualityMid))
-			// send PLI to make sure the client will receive the first frame
-			t.remoteTrack.sendPLI()
-		} else if t.remoteTrack.GetRemoteTrack(QualityHigh) != nil && quality == QualityHigh {
-			t.lastQuality.Store(uint32(QualityHigh))
-			// send PLI to make sure the client will receive the first frame
-			t.remoteTrack.sendPLI()
+	if forwarding != target && quality == target {
+		var mapped bool
+
+		switch quality {
+		case QualityHigh:
+			mapped, _, _ = t.packetmapHigh.Map(p.SequenceNumber, 0)
+		case QualityMid:
+			mapped, _, _ = t.packetmapMid.Map(p.SequenceNumber, 0)
+		case QualityLow:
+			mapped, _, _ = t.packetmapLow.Map(p.SequenceNumber, 0)
 		}
 
-		t.remoteTrack.onRemoteTrackAdded(func(remote *remoteTrack) {
-			t.remoteTrack.sendPLI()
-		})
-	} else if isKeyframe && canSwitch && quality == targetQuality && currentQuality != targetQuality {
-		// change quality to target quality if it's a keyframe
-		t.client.log.Tracef("track: %s keyframe %v change quality from %d to %d ", t.id, isKeyframe, t.lastQuality.Load(), targetQuality)
-		currentQuality = targetQuality
-		t.lastQuality.Store(uint32(currentQuality))
+		// A codec whose keyframes cannot be read would never open the gate, so
+		// it is not gated: it starts on whatever arrives, as every codec did
+		// before this.
+		opensAFrame := !t.detectsKeyframes || IsKeyframe(t.mimeType, p.Payload)
 
-	} else if quality == targetQuality && !isKeyframe && currentQuality != targetQuality {
-		// request PLI to allow us switch quality to target quality
-		t.client.log.Tracef("track: %s keyframe %v send keyframe and sequence number %d and can switch %v ", t.id, isKeyframe, p.SequenceNumber, canSwitch)
-		t.remoteTrack.sendPLI()
+		if canStartForwarding(forwarding, target, quality, opensAFrame, mapped) {
+			t.client.log.Tracef("track: %s forwarding quality %d in place of %d", t.id, target, forwarding)
+
+			forwarding = target
+			t.forwardedQuality.Store(uint32(forwarding))
+			t.lastQuality.Store(uint32(forwarding))
+		} else {
+			// Nothing to switch on yet. This is the first packet of all as well,
+			// where nothing is being forwarded and the track has not started: it
+			// starts on a keyframe or it does not start. remoteTrack throttles
+			// these to one every 250ms, so asking on every packet costs nothing.
+			t.remoteTrack.sendPLI()
+		}
 	}
 
-	if currentQuality == quality {
+	if forwarding == quality {
 		t.send(p, quality)
 	}
 }
@@ -323,10 +399,15 @@ func (t *simulcastClientTrack) IsScaleable() bool {
 // Every layer is a separate RTP stream with its own randomly chosen sequence
 // number and timestamp base, so neither number can be forwarded as it stands.
 // Both are carried by counters of this track's own, and both are stepped on at
-// the moment the forwarded layer changes: the sequence number by one packet,
-// and the timestamp by one frame, placing the first frame of the new layer
-// immediately after the last frame of the old one. Off a switch they follow
-// whatever the source layer did.
+// the moment the forwarded layer changes: the sequence number by one packet and
+// the timestamp by [simulcastClientTrack.switchGap], placing the first frame of
+// the new layer immediately after the last frame of the old one. Off a switch
+// they follow whatever the source layer did, so the publisher's own pacing and
+// its real gaps come through untouched.
+//
+// push only changes the forwarded layer at the first packet of a keyframe, which
+// is what makes it safe to move the offset here: every packet of a frame is
+// rewritten against the same one.
 //
 // The offset used to be a fixed anchor recorded per layer instead, which made a
 // switch move the timeline by the difference between two unrelated random
@@ -366,7 +447,7 @@ func (t *simulcastClientTrack) rewritePacket(p *rtp.Packet, quality QualityLevel
 		// gap is meaningless here — against a layer being read for the first
 		// time it is the whole of that layer's starting sequence number, which
 		// reads downstream as tens of thousands of packets lost at once.
-		t.timestampOffset.Store(t.lastSentTimestamp.Load() + t.frameDuration() - p.Timestamp)
+		t.timestampOffset.Store(t.lastSentTimestamp.Load() + t.switchGap() - p.Timestamp)
 		t.sequenceNumber.Add(1)
 	} else {
 		// Within a layer the gap is real and is carried through, so a packet
@@ -381,6 +462,54 @@ func (t *simulcastClientTrack) rewritePacket(p *rtp.Packet, quality QualityLevel
 
 	t.lastSentTimestamp.Store(p.Timestamp)
 	t.lastSentQuality.Store(uint32(quality))
+	t.lastForwardedAt.Store(t.now().UnixNano())
+}
+
+// maxSwitchGap bounds how far one switch may move the subscriber's clock.
+//
+// Not a judgement about timing — it is there so that a track resumed after long
+// enough cannot overflow the 32-bit timestamp arithmetic below. Thirty seconds
+// is already several times what any receiver will wait for a frame.
+const maxSwitchGap = 30 * time.Second
+
+// switchGap is how far the subscriber's clock moves across a layer switch.
+//
+// The wait for the new layer's keyframe is real time the viewer spent on the old
+// layer's last frame, so the timeline has to account for it. Folding it into a
+// single nominal frame instead tells the receiver that a frame turned up later
+// than its timestamp said it should have, and its jitter estimate grows by the
+// difference; enough of those and it holds the picture back by seconds and then
+// throws the backlog away.
+//
+// Floored at one frame, so the clock always moves forward even for a switch that
+// lands within a frame of the packet before it.
+func (t *simulcastClientTrack) switchGap() uint32 {
+	frame := t.frameDuration()
+
+	last := t.lastForwardedAt.Load()
+	if last == 0 {
+		return frame
+	}
+
+	elapsed := t.now().Sub(time.Unix(0, last))
+	if elapsed > maxSwitchGap {
+		elapsed = maxSwitchGap
+	}
+
+	if gap := uint32(elapsed.Seconds() * float64(t.clockRate)); gap > frame {
+		return gap
+	}
+
+	return frame
+}
+
+// now is time.Now unless a test has replaced it.
+func (t *simulcastClientTrack) now() time.Time {
+	if t.clock != nil {
+		return t.clock()
+	}
+
+	return time.Now()
 }
 
 // frameDuration is one frame at the track's clock, in RTP timestamp units.
