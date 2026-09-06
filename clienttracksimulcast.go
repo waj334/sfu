@@ -424,7 +424,15 @@ func (t *simulcastClientTrack) ReceiveBitrateAtQuality(quality QualityLevel) uin
 
 	bitrate, err := t.baseTrack.client.stats.GetReceiverBitrate(remoteTrack.track.ID(), remoteTrack.track.RID())
 	if err != nil {
-		t.client.log.Errorf("clienttrack: error on get receiver", err)
+		// The receiver's half of what SendBitrate already skips: the stats are
+		// written by a ticker, so a layer that has not been read from yet has
+		// none, and every subscribe logged one of these per layer. The error
+		// also went to a format string with no verb for it, which is where the
+		// "%!(EXTRA ...)" came from.
+		if !errors.Is(err, ErrCLientStatsNotFound) {
+			t.client.log.Errorf("clienttrack: error on get receiver bitrate %s", err.Error())
+		}
+
 		return 0
 	}
 
