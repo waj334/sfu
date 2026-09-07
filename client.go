@@ -148,6 +148,11 @@ type Client struct {
 	initialReceiverCount  atomic.Uint32
 	initialSenderCount    atomic.Uint32
 	trackWaitStartTime    time.Time
+	// muSending serialises choosing a transceiver to send a track on. Asking
+	// whether one is free and then taking it is two steps, and two
+	// subscriptions arriving together would otherwise both be told the same
+	// one was.
+	muSending             sync.Mutex
 	isInRenegotiation     *atomic.Bool
 	isInRemoteNegotiation *atomic.Bool
 	idleTimeoutContext    context.Context
@@ -1023,6 +1028,68 @@ func (c *Client) allowRemoteRenegotiation() {
 	}
 }
 
+// addSendingTrack puts a track on this client's peer connection, on a
+// transceiver the client already has wherever there is one to use.
+//
+// A subscriber says up front what it wants to receive, and pion mirrors each of
+// those m-lines into a transceiver on this side that is ready to send on. This
+// used to add every track with AddTransceiverFromTrack, which never reuses
+// anything — it appends an m-line and leaves the mirror behind, saying it will
+// send with nothing to send.
+//
+// pion does not consider a transceiver in that state negotiated, so it asks for
+// renegotiation, offers a description that changes nothing, and asks again: an
+// offer and answer every hundred milliseconds for as long as the subscriber is
+// connected. Each one rebuilds the receiver on the far side, which is why the
+// picture never settled even once the media was arriving.
+//
+// AddTrack reuses the mirror. The fallback is only for when there is nothing to
+// reuse, and it stays on AddTransceiverFromTrack to keep the direction honest:
+// a transceiver AddTrack makes for itself is sendrecv, which invites the
+// subscriber to publish onto a line that exists to send to it.
+func addSendingTrack(pc *webrtc.PeerConnection, track webrtc.TrackLocal) (*webrtc.RTPSender, error) {
+	if hasFreeTransceiver(pc, track.Kind()) {
+		return pc.AddTrack(track)
+	}
+
+	transceiver, err := pc.AddTransceiverFromTrack(track, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendonly,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return transceiver.Sender(), nil
+}
+
+// hasFreeTransceiver reports whether the client has a transceiver of this kind
+// that exists to send and has nothing to send on it.
+//
+// Send-only and nothing else. That is the shape of the mirror pion raises for
+// an m-line a subscriber asked to receive on, and it is the only shape safe to
+// put a track on: a transceiver carrying a track this client is publishing to
+// us is receive-only, and it also has no sender, so asking only whether a
+// sender is missing hands out the very line the publisher's own track arrives
+// on. Doing that stalled every simulcast publisher.
+//
+// pion applies the same rule and one more, weighing the direction already
+// negotiated, which cannot be read from out here. Being stricter than pion
+// costs nothing — a transceiver not offered for reuse is one AddTransceiverFromTrack
+// creates, which is what happened for every track before any of this.
+func hasFreeTransceiver(pc *webrtc.PeerConnection, kind webrtc.RTPCodecType) bool {
+	for _, transceiver := range pc.GetTransceivers() {
+		if transceiver.Kind() != kind || transceiver.Sender() != nil {
+			continue
+		}
+
+		if transceiver.Direction() == webrtc.RTPTransceiverDirectionSendonly {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (c *Client) setClientTrack(t ITrack) iClientTrack {
 	var outputTrack iClientTrack
 
@@ -1048,9 +1115,12 @@ func (c *Client) setClientTrack(t ITrack) iClientTrack {
 
 	localTrack := outputTrack.LocalTrack()
 
-	senderTcv, err := c.peerConnection.PC().AddTransceiverFromTrack(localTrack, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
+	c.muSending.Lock()
+	sender, err := addSendingTrack(c.peerConnection.PC(), localTrack)
+	c.muSending.Unlock()
+
 	if err != nil {
-		c.log.Errorf("client: error on adding track ", err)
+		c.log.Errorf("client: error on adding track %s", err.Error())
 		return nil
 	}
 
@@ -1068,8 +1138,6 @@ func (c *Client) setClientTrack(t ITrack) iClientTrack {
 			c.muTracks.Unlock()
 		}()
 
-		sender := senderTcv.Sender()
-
 		if sender == nil {
 			return
 		}
@@ -1078,7 +1146,7 @@ func (c *Client) setClientTrack(t ITrack) iClientTrack {
 	})
 
 	// enable RTCP report and stats
-	c.enableReportAndStats(senderTcv.Sender(), outputTrack)
+	c.enableReportAndStats(sender, outputTrack)
 
 	c.muTracks.Lock()
 	c.clientTracks[outputTrack.ID()] = outputTrack
