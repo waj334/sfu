@@ -465,11 +465,28 @@ func (t *SimulcastTrack) onRemoteTrackAdded(f func(*remoteTrack)) {
 	t.onAddedRemoteTrackCallbacks = append(t.onAddedRemoteTrackCallbacks, f)
 }
 
+// onRemoteTrackAddedCallbacks tells everyone watching that a layer has turned
+// up.
+//
+// The callbacks are copied out under the lock and run outside it, the way
+// [SimulcastTrack.onEnded] already does. Running them beneath it deadlocks the
+// moment one of them touches this track — sendPLI, isTrackActive, GetRemoteTrack
+// all take this same mutex, and a Go RWMutex is not reentrant, so the goroutine
+// adding the layer blocks on a lock it is holding itself.
+//
+// It stood for a long time only because nothing was ever registered: the sole
+// caller of onRemoteTrackAdded sat in a branch of push that could not be
+// reached. The first real subscriber to register one wedged the track — layers
+// two and three never finished being added, so the publisher's media arrived and
+// none of it was forwarded, and the subscriber's transceiver stayed empty and
+// renegotiated in a loop over a track it was never given.
 func (t *SimulcastTrack) onRemoteTrackAddedCallbacks(track *remoteTrack) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	callbacks := make([]func(*remoteTrack), len(t.onAddedRemoteTrackCallbacks))
+	copy(callbacks, t.onAddedRemoteTrackCallbacks)
+	t.mu.RUnlock()
 
-	for _, f := range t.onAddedRemoteTrackCallbacks {
+	for _, f := range callbacks {
 		f(track)
 	}
 }
@@ -481,11 +498,19 @@ func (t *SimulcastTrack) OnTrackComplete(f func()) {
 	t.onTrackCompleteCallbacks = append(t.onTrackCompleteCallbacks, f)
 }
 
+// onTrackComplete tells everyone watching that all three layers have arrived.
+//
+// Copied out and run outside the lock for the same reason as
+// [SimulcastTrack.onRemoteTrackAddedCallbacks]: it is called from the same place,
+// about the same track, and a callback that looks at the track it is being told
+// about is the ordinary case rather than a strange one.
 func (t *SimulcastTrack) onTrackComplete() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	callbacks := make([]func(), len(t.onTrackCompleteCallbacks))
+	copy(callbacks, t.onTrackCompleteCallbacks)
+	t.mu.RUnlock()
 
-	for _, f := range t.onTrackCompleteCallbacks {
+	for _, f := range callbacks {
 		f()
 	}
 }
