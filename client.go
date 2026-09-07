@@ -948,7 +948,7 @@ func (c *Client) renegotiate(offerFlexFec bool) {
 
 				offer, err := c.peerConnection.PC().CreateOffer(nil)
 				if err != nil {
-					c.log.Errorf("sfu: error create offer on renegotiation ", err)
+					c.log.Errorf("sfu: error create offer on renegotiation %s", err.Error())
 					return
 				}
 
@@ -961,7 +961,7 @@ func (c *Client) renegotiate(offerFlexFec bool) {
 				// Sets the LocalDescription, and starts our UDP listeners
 				err = c.peerConnection.PC().SetLocalDescription(offer)
 				if err != nil {
-					c.log.Errorf("sfu: error set local description on renegotiation ", err)
+					c.log.Errorf("sfu: error set local description on renegotiation %s", err.Error())
 					_ = c.stop()
 
 					return
@@ -972,7 +972,7 @@ func (c *Client) renegotiate(offerFlexFec bool) {
 				answer, err := c.onRenegotiation(c.context, sdp)
 				if err != nil {
 					//TODO: when this happen, we need to close the client and ask the remote client to reconnect
-					c.log.Errorf("sfu: error on renegotiation ", err)
+					c.log.Errorf("sfu: error on renegotiation %s", err.Error())
 					_ = c.stop()
 
 					return
@@ -987,6 +987,14 @@ func (c *Client) renegotiate(offerFlexFec bool) {
 
 				err = c.peerConnection.PC().SetRemoteDescription(answer)
 				if err != nil {
+					// Said out loud, and with the answer that could not be
+					// applied. This is the one place in the renegotiation that
+					// ends a client's session without explaining itself, and it
+					// is not a rare one: an answer this side will not accept
+					// closes the peer connection, so the subscriber's picture
+					// never starts and the only trace left anywhere is a
+					// connection going to "closed" for no stated reason.
+					c.log.Errorf("sfu: error set remote description on renegotiation %s, answer: %s", err.Error(), answer.SDP)
 					_ = c.stop()
 
 					return
