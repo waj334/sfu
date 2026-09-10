@@ -317,23 +317,19 @@ func (r *Room) Stats() RoomStats {
 
 	defer r.mu.RUnlock()
 
+	// Each client's totals are taken under that client's own locks rather than
+	// read straight out of its maps here. The room lock held above covers
+	// r.stats -- which clients are in it -- and nothing about what is inside
+	// any of them: those maps are written by the per-client bitrate monitor,
+	// which holds only the client's lock and knows nothing about this one.
 	for _, cstats := range r.stats {
-		for _, stat := range cstats.receivers {
-			bytesReceived += stat.BytesReceived
-		}
+		bytes, bitrate := cstats.sumReceived()
+		bytesReceived += bytes
+		bitratesReceived += bitrate
 
-		for _, stat := range cstats.receiverBitrates {
-			bitratesReceived += uint64(stat)
-		}
-
-		for _, stat := range cstats.senderBitrates {
-			bitratesSent += uint64(stat)
-		}
-
-		for _, stat := range cstats.senders {
-			bytesSent += stat.OutboundRTPStreamStats.BytesSent
-		}
-
+		bytes, bitrate = cstats.sumSent()
+		bytesSent += bytes
+		bitratesSent += bitrate
 	}
 
 	roomStats := RoomStats{

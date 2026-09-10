@@ -24,7 +24,17 @@ type voiceActivityStats struct {
 	staticVoiceActivityStats
 }
 
+// TrackStats is a client's per-track counters, and the locks that guard them.
+//
+// The locks live here rather than on ClientStats because this is the part that
+// gets shared: a room keeps the very same *TrackStats its client does, so a
+// lock kept one level up stayed behind with the wrapper and left the room
+// holding the maps with nothing to hold them still. ClientStats embeds this,
+// so every c.senderMu below still means the lock beside the maps it is about.
 type TrackStats struct {
+	senderMu   sync.RWMutex
+	receiverMu sync.RWMutex
+
 	senders          map[string]stats.Stats
 	senderBitrates   map[string]uint32
 	receivers        map[string]stats.Stats
@@ -32,19 +42,15 @@ type TrackStats struct {
 }
 
 type ClientStats struct {
-	mu         sync.Mutex
-	senderMu   sync.RWMutex
-	receiverMu sync.RWMutex
-	Client     *Client
+	mu     sync.Mutex
+	Client *Client
 	*TrackStats
 	voiceActivity voiceActivityStats
 }
 
 func newClientStats(c *Client) *ClientStats {
 	cstats := &ClientStats{
-		senderMu:   sync.RWMutex{},
-		receiverMu: sync.RWMutex{},
-		Client:     c,
+		Client: c,
 		TrackStats: &TrackStats{
 			senders:          make(map[string]stats.Stats),
 			receivers:        make(map[string]stats.Stats),
@@ -134,6 +140,45 @@ func (c *ClientStats) removeReceiverStats(trackId string) {
 	defer c.receiverMu.Unlock()
 
 	delete(c.receivers, trackId)
+}
+
+// sumReceived totals this client's received bytes and receive bitrate.
+//
+// Here rather than in the caller because the lock is here. Room.Stats used to
+// walk these maps itself holding only the room's lock, which says nothing
+// about them: they are written by the bitrate monitor each client starts for
+// itself, under the locks above. Iterating a map while another goroutine
+// writes it is not a race the runtime tolerates -- it stops the process, and
+// being fatal rather than a panic, no recover up the stack can catch it.
+func (c *TrackStats) sumReceived() (bytes uint64, bitrate uint64) {
+	c.receiverMu.RLock()
+	defer c.receiverMu.RUnlock()
+
+	for _, stat := range c.receivers {
+		bytes += stat.BytesReceived
+	}
+
+	for _, rate := range c.receiverBitrates {
+		bitrate += uint64(rate)
+	}
+
+	return bytes, bitrate
+}
+
+// sumSent totals this client's sent bytes and send bitrate. See [sumReceived].
+func (c *TrackStats) sumSent() (bytes uint64, bitrate uint64) {
+	c.senderMu.RLock()
+	defer c.senderMu.RUnlock()
+
+	for _, stat := range c.senders {
+		bytes += stat.OutboundRTPStreamStats.BytesSent
+	}
+
+	for _, rate := range c.senderBitrates {
+		bitrate += uint64(rate)
+	}
+
+	return bytes, bitrate
 }
 
 func (c *ClientStats) Senders() map[string]stats.Stats {
