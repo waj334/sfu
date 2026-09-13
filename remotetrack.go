@@ -33,6 +33,9 @@ type remoteTrack struct {
 	onStatsUpdated        func(*stats.Stats)
 	log                   logging.LeveledLogger
 	rtppool               *rtppool.RTPPool
+
+	// duplicates is touched only by readRTP's goroutine.
+	duplicates duplicateFilter
 }
 
 func newRemoteTrack(ctx context.Context, log logging.LeveledLogger, useBuffer bool, track IRemoteTrack, minWait, maxWait, pliInterval time.Duration, onPLI func(), statsGetter stats.Getter, onStatsUpdated func(*stats.Stats), onRead func(interceptor.Attributes, *rtp.Packet), pool *rtppool.RTPPool, onNetworkConditionChanged func(networkmonitor.NetworkConditionType)) *remoteTrack {
@@ -110,6 +113,15 @@ func (t *remoteTrack) readRTP() {
 
 			if err := p.Unmarshal(buffer[:n]); err != nil {
 				t.log.Errorf("remotetrack: unmarshal error: %s", err.Error())
+				t.rtppool.PutPacket(p)
+				continue
+			}
+
+			// A packet already delivered is not delivered again. The second copy
+			// is almost always a retransmission of a packet that also arrived
+			// the first time, and forwarding it sends every subscriber the same
+			// media twice. See duplicateFilter.
+			if t.duplicates.seen(p.SequenceNumber) {
 				t.rtppool.PutPacket(p)
 				continue
 			}

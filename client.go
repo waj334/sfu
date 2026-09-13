@@ -252,8 +252,9 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		}
 	}
 
-	// Use the default set of Interceptors
-	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
+	// pion's default set of interceptors, with a limit on how often a lost
+	// packet is asked for. See registerInterceptors.
+	if err := registerInterceptors(m, i); err != nil {
 		panic(err)
 	}
 
