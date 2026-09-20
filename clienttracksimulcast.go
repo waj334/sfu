@@ -62,6 +62,22 @@ func newSimulcastClientTrack(c *Client, t *SimulcastTrack) *simulcastClientTrack
 
 	lastTimestamp := &atomic.Uint32{}
 
+	// The most this viewer can use, until it says otherwise.
+	//
+	// High, and not the zero value. A viewer narrows this by reporting the size
+	// it is watching at, over the node's internal data channel, and the quality
+	// actually sent is the least of that, the claim and the client's own
+	// ceiling. Left at zero the least is QualityNone, so a viewer that never
+	// reports a size is sent no video at all -- not a lower rung, nothing --
+	// and has no way to ask for any, because the report names a track and a
+	// viewer only learns the name from a packet that will never arrive.
+	//
+	// The scaleable track has always started at High for the same reason; this
+	// one starting at zero was the difference between a viewer seeing the
+	// stream and seeing silence.
+	maxQuality := &atomic.Uint32{}
+	maxQuality.Store(uint32(QualityHigh))
+
 	ctx, cancel := context.WithCancel(t.context)
 
 	ct := &simulcastClientTrack{
@@ -78,7 +94,7 @@ func newSimulcastClientTrack(c *Client, t *SimulcastTrack) *simulcastClientTrack
 		sequenceNumber:          sequenceNumber,
 		lastQuality:             lastQuality,
 		paddingTS:               &atomic.Uint32{},
-		maxQuality:              &atomic.Uint32{},
+		maxQuality:              maxQuality,
 		lastBlankSequenceNumber: &atomic.Uint32{},
 		lastTimestamp:           lastTimestamp,
 		clockRate:               track.Codec().ClockRate,
