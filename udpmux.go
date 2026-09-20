@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"context"
+	"strings"
 
 	"github.com/pion/ice/v4"
 )
@@ -21,6 +22,12 @@ func NewUDPMux(ctx context.Context, port int) *UDPMux {
 		ice.UDPMuxFromPortWithWriteBufferSize(25_000_000),
 		ice.UDPMuxFromPortWithNetworks(ice.NetworkTypeUDP4),
 		ice.UDPMuxFromPortWithLoopback(),
+		ice.UDPMuxFromPortWithInterfaceFilter(func(name string) bool {
+			return !strings.HasPrefix(name, "nordlynx") &&
+				!strings.HasPrefix(name, "tailscale") &&
+				!strings.HasPrefix(name, "docker") &&
+				!strings.HasPrefix(name, "br-")
+		}),
 	}
 
 	mux, err := ice.NewMultiUDPMuxFromPort(port, opts...)

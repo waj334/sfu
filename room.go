@@ -64,6 +64,8 @@ type Room struct {
 	sfu                     *SFU
 	state                   string
 	stats                   map[string]*TrackStats
+	cumulativeBytesReceived uint64
+	cumulativeBytesSent     uint64
 	kind                    string
 	extensions              []IExtension
 	OnEvent                 func(event Event)
@@ -202,41 +204,6 @@ func (r *Room) AddClient(id, name string, opts ClientOptions) (*Client, error) {
 
 	client = r.sfu.NewClient(id, name, opts)
 
-	// stop client if not connecting for a specific time
-	initConnection := true
-	go func() {
-		timeout, cancel := context.WithTimeout(client.context, opts.IdleTimeout)
-		defer cancel()
-
-		mu := sync.Mutex{}
-
-		connectingChan := make(chan bool)
-
-		timeoutReached := false
-
-		client.OnConnectionStateChanged(func(state webrtc.PeerConnectionState) {
-			mu.Lock()
-			defer mu.Unlock()
-
-			if initConnection && state == webrtc.PeerConnectionStateConnected && !timeoutReached {
-				connectingChan <- true
-
-				// set to false so we don't send the connectingChan again because no more listener
-				initConnection = false
-			}
-		})
-
-		select {
-		case <-timeout.Done():
-			r.sfu.log.Warnf("room: client is not connected after added, stopping client...")
-			_ = client.stop()
-			timeoutReached = true
-
-		case <-connectingChan:
-			return
-		}
-	}()
-
 	client.OnJoined(func() {
 		r.onClientJoined(client)
 	})
@@ -276,7 +243,13 @@ func (r *Room) onClientLeft(client *Client) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.stats[client.ID()] = client.stats.TrackStats
+	if client.stats != nil && client.stats.TrackStats != nil {
+		bytesRecv, _ := client.stats.TrackStats.sumReceived()
+		bytesSent, _ := client.stats.TrackStats.sumSent()
+		r.cumulativeBytesReceived += bytesRecv
+		r.cumulativeBytesSent += bytesSent
+	}
+	delete(r.stats, client.ID())
 }
 
 func (r *Room) onClientJoined(client *Client) {
@@ -304,16 +277,16 @@ func (r *Room) SFU() *SFU {
 // The client stats and it's tracks will be removed from the stats if the client or track is removed.
 // But the aggregated stats will still be there and included in the room stats even if they're removed.
 func (r *Room) Stats() RoomStats {
-	var (
-		bytesReceived    uint64
-		bytesSent        uint64
-		bitratesSent     uint64
-		bitratesReceived uint64
-	)
-
 	clientStats := make(map[string]ClientTrackStats)
 
 	r.mu.RLock()
+
+	var (
+		bytesReceived    uint64 = r.cumulativeBytesReceived
+		bytesSent        uint64 = r.cumulativeBytesSent
+		bitratesSent     uint64
+		bitratesReceived uint64
+	)
 
 	defer r.mu.RUnlock()
 
@@ -374,8 +347,23 @@ func (r *Room) updateStats() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for _, client := range r.sfu.clients.GetClients() {
-		r.stats[client.ID()] = client.stats.TrackStats
+	activeClients := r.sfu.clients.GetClients()
+	for _, client := range activeClients {
+		if client.stats != nil {
+			r.stats[client.ID()] = client.stats.TrackStats
+		}
+	}
+
+	for id, cstats := range r.stats {
+		if _, ok := activeClients[id]; !ok {
+			if cstats != nil {
+				bytesRecv, _ := cstats.sumReceived()
+				bytesSent, _ := cstats.sumSent()
+				r.cumulativeBytesReceived += bytesRecv
+				r.cumulativeBytesSent += bytesSent
+			}
+			delete(r.stats, id)
+		}
 	}
 }
 

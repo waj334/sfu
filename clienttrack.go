@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -30,6 +31,7 @@ type iClientTrack interface {
 	SendBitrate() uint32
 	Quality() QualityLevel
 	OnEnded(func())
+	onEnded()
 }
 
 type clientTrack struct {
@@ -47,6 +49,7 @@ type clientTrack struct {
 	isScreen              bool
 	ssrc                  webrtc.SSRC
 	onTrackEndedCallbacks []func()
+	isEnded               atomic.Bool
 }
 
 func newClientTrack(c *Client, t ITrack, isScreen bool, localTrack *webrtc.TrackLocalStaticRTP) *clientTrack {
@@ -223,10 +226,16 @@ func (t *clientTrack) OnEnded(f func()) {
 }
 
 func (t *clientTrack) onEnded() {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	if !t.isEnded.CompareAndSwap(false, true) {
+		return
+	}
 
-	for _, f := range t.onTrackEndedCallbacks {
+	t.mu.RLock()
+	callbacks := make([]func(), len(t.onTrackEndedCallbacks))
+	copy(callbacks, t.onTrackEndedCallbacks)
+	t.mu.RUnlock()
+
+	for _, f := range callbacks {
 		f()
 	}
 }

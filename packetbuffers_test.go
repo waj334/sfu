@@ -51,7 +51,7 @@ func TestAdd(t *testing.T) {
 
 	i := 0
 	for e := caches.buffers.Front(); e != nil; e = e.Next() {
-		packet := e.Value.(*rtppool.RetainablePacket)
+		packet := e.Value.(*Packet).Packet
 		require.Equal(t, packet.Header().SequenceNumber, sortedNumbers[i], fmt.Sprintf("packet sequence number %d should be equal to sortedNumbers sequence number %d", packet.Header().SequenceNumber, sortedNumbers[i]))
 		i++
 		packet.Release()
@@ -96,7 +96,7 @@ func TestAddLost(t *testing.T) {
 
 	i := 0
 	for e := caches.buffers.Front(); e != nil; e = e.Next() {
-		packet := e.Value.(*rtppool.RetainablePacket)
+		packet := e.Value.(*Packet).Packet
 		if sortedNumbers[i] == 65533 {
 			i++
 		}

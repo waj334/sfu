@@ -161,7 +161,32 @@ func New(ctx context.Context, opts sfuOptions) *SFU {
 		defaultSettingEngine:      opts.SettingEngine,
 	}
 
+	go sfu.monitorLoop(localCtx)
+
 	return sfu
+}
+
+func (s *SFU) monitorLoop(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	var tickCount uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tickCount++
+			for _, client := range s.clients.GetClients() {
+				if client.stats != nil {
+					client.stats.tick()
+				}
+				if tickCount%3 == 0 && client.bitrateController != nil {
+					client.bitrateController.tick()
+				}
+			}
+		}
+	}
 }
 
 func (s *SFU) addClient(client *Client) {

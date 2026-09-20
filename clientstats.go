@@ -45,7 +45,9 @@ type ClientStats struct {
 	mu     sync.Mutex
 	Client *Client
 	*TrackStats
-	voiceActivity voiceActivityStats
+	voiceActivity             voiceActivityStats
+	lastSenderBytesSent       map[string]uint64
+	lastReceiverBytesReceived map[string]uint64
 }
 
 func newClientStats(c *Client) *ClientStats {
@@ -61,27 +63,38 @@ func newClientStats(c *Client) *ClientStats {
 			mu:     sync.Mutex{},
 			active: false,
 		},
+		lastSenderBytesSent:       make(map[string]uint64),
+		lastReceiverBytesReceived: make(map[string]uint64),
 	}
 
-	go cstats.monitorBitrates(c.Context())
+	// Only spawn a standalone goroutine if there is no parent SFU running a central monitor loop
+	if c.sfu == nil {
+		go cstats.monitorBitrates(c.Context())
+	}
 
 	return cstats
+}
+
+func (c *ClientStats) tick() {
+	if c.Client != nil {
+		c.Client.updateAllSenderStats()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastSenderBytesSent = c.updateSenderBitrates(c.lastSenderBytesSent)
+	c.lastReceiverBytesReceived = c.updateReceiverBitrates(c.lastReceiverBytesReceived)
 }
 
 func (c *ClientStats) monitorBitrates(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	var lastSenderBytesSent = make(map[string]uint64)
-	var lastReceiverBytesReceived = make(map[string]uint64)
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			lastSenderBytesSent = c.updateSenderBitrates(lastSenderBytesSent)
-			lastReceiverBytesReceived = c.updateReceiverBitrates(lastReceiverBytesReceived)
+			c.tick()
 		}
 	}
 }

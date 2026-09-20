@@ -77,6 +77,7 @@ func filterRoutines(routines []string) []string {
 			strings.Contains(stack, "turn/v4.NewServer") || // turn server
 			strings.Contains(stack, "sfu.StartTurnServer") || // stun server
 			strings.Contains(stack, "sfu.StartStunServer") || // stun server
+			strings.Contains(stack, "sfu.(*SFU).monitorLoop") || // sfu central monitor loop
 			strings.Contains(stack, "sfu.getRoutines(") { // This routine
 
 			continue

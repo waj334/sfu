@@ -129,7 +129,8 @@ func newTrack(ctx context.Context, client *Client, trackRemote IRemoteTrack, min
 		client.onNetworkConditionChanged(condition)
 	}
 
-	t.remoteTrack = newRemoteTrack(ctx, client.log, client.options.ReorderPackets, trackRemote, minWait, maxWait, pliInterval, onPLI, stats, onStatsUpdated, onRead, pool, onNetworkConditionChanged)
+	t.remoteTrack = newRemoteTrack(ctx, client.log, client.options.ReorderPackets, trackRemote, minWait, maxWait, pliInterval, client.options.PLIGap, onPLI, stats, onStatsUpdated, onRead, pool, onNetworkConditionChanged)
+	watchRemoteTrack(client, t.remoteTrack)
 
 	var cancel context.CancelFunc
 
@@ -585,7 +586,8 @@ func (t *SimulcastTrack) AddRemoteTrack(track IRemoteTrack, minWait, maxWait tim
 
 	}
 
-	remoteTrack = newRemoteTrack(t.Context(), t.base.client.log, t.reordered, track, minWait, maxWait, t.pliInterval, onPLI, stats, onStatsUpdated, onRead, t.base.pool, t.onNetworkConditionChanged)
+	remoteTrack = newRemoteTrack(t.Context(), t.base.client.log, t.reordered, track, minWait, maxWait, t.pliInterval, t.base.client.options.PLIGap, onPLI, stats, onStatsUpdated, onRead, t.base.pool, t.onNetworkConditionChanged)
+	watchRemoteTrack(t.base.client, remoteTrack)
 
 	switch quality {
 	case QualityHigh:
@@ -725,44 +727,25 @@ func (t *SimulcastTrack) isTrackActive(quality QualityLevel) bool {
 	switch quality {
 	case QualityHigh:
 		if t.remoteTrackHigh == nil {
-			t.base.client.log.Warnf("track: remote track high is nil")
 			return false
 		}
 
 		delta := time.Since(time.Unix(0, t.lastReadHighTS.Load()))
-
-		if delta > threshold {
-			t.base.client.log.Warnf("track: remote track %s high is not active, last read was %d ms ago", t.base.id, delta.Milliseconds())
-			return false
-		}
-
-		return true
+		return delta <= threshold
 	case QualityMid:
 		if t.remoteTrackMid == nil {
-			t.base.client.log.Warnf("track: remote track medium is nil")
 			return false
 		}
 
 		delta := time.Since(time.Unix(0, t.lastReadMidTS.Load()))
-		if delta > threshold {
-			t.base.client.log.Warnf("track: remote track %s mid is not active, last read was %d ms ago", delta.Milliseconds())
-			return false
-		}
-
-		return true
+		return delta <= threshold
 	case QualityLow:
 		if t.remoteTrackLow == nil {
-			t.base.client.log.Warnf("track: remote track low is nil")
 			return false
 		}
 
 		delta := time.Since(time.Unix(0, t.lastReadLowTS.Load()))
-		if delta > threshold {
-			t.base.client.log.Warnf("track: remote track %s low is not active, last read was %d ms ago", delta.Milliseconds())
-			return false
-		}
-
-		return true
+		return delta <= threshold
 	}
 
 	return false
@@ -1000,8 +983,8 @@ func (t *trackList) remove(ids []string) {
 }
 
 func (t *trackList) Reset() {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
 	t.tracks = make(map[string]ITrack)
 }

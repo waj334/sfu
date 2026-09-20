@@ -109,15 +109,25 @@ type bitrateController struct {
 	log                  logging.LeveledLogger
 }
 
+var defaultBitrateControllerLogger = logging.NewDefaultLoggerFactory().NewLogger("bitratecontroller")
+
 func newbitrateController(client *Client, qualityLevels []QualityLevel) *bitrateController {
+	var l logging.LeveledLogger = defaultBitrateControllerLogger
+	if client != nil && client.log != nil {
+		l = client.log
+	}
+
 	bc := &bitrateController{
 		client:               client,
 		claims:               sync.Map{},
 		enabledQualityLevels: qualityLevels,
-		log:                  logging.NewDefaultLoggerFactory().NewLogger("bitratecontroller"),
+		log:                  l,
 	}
 
-	go bc.loopMonitor()
+	// Only spawn a standalone goroutine if there is no parent SFU running a central monitor loop
+	if client.sfu == nil {
+		go bc.loopMonitor()
+	}
 
 	return bc
 }
@@ -408,6 +418,42 @@ func (bc *bitrateController) canIncreaseBitrate(availableBw uint32) bool {
 	return false
 }
 
+func (bc *bitrateController) tick() {
+	var needAdjustment bool
+
+	totalSendBitrates := bc.totalSentBitrates()
+	bw := bc.client.GetEstimatedBandwidth()
+
+	if totalSendBitrates == 0 {
+		return
+	}
+
+	var availableBw uint32
+	if bw < totalSendBitrates {
+		availableBw = 0
+	} else {
+		availableBw = bw - totalSendBitrates
+	}
+
+	if totalSendBitrates < uint32(bw) {
+		needAdjustment = bc.canIncreaseBitrate(availableBw)
+		if needAdjustment {
+			bc.log.Tracef("bitratecontroller: need to increase bitrate, available bandwidth %s", ThousandSeparator(int(availableBw)))
+		}
+	} else {
+		needAdjustment = bc.canDecreaseBitrate()
+		if needAdjustment {
+			bc.log.Tracef("bitratecontroller: need to decrease bitrate, available bandwidth ", ThousandSeparator(int(availableBw)))
+		}
+	}
+
+	if !needAdjustment {
+		return
+	}
+
+	bc.fitBitratesToBandwidth(uint32(bw))
+}
+
 func (bc *bitrateController) loopMonitor() {
 	ctx, cancel := context.WithCancel(bc.client.Context())
 	defer cancel()
@@ -420,42 +466,9 @@ func (bc *bitrateController) loopMonitor() {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			var needAdjustment bool
-
-			totalSendBitrates := bc.totalSentBitrates()
-			bw := bc.client.GetEstimatedBandwidth()
-
-			if totalSendBitrates == 0 {
-				continue
-			}
-
-			var availableBw uint32
-			if bw < totalSendBitrates {
-				availableBw = 0
-			} else {
-				availableBw = bw - totalSendBitrates
-			}
-
-			if totalSendBitrates < uint32(bw) {
-				needAdjustment = bc.canIncreaseBitrate(availableBw)
-				if needAdjustment {
-					bc.log.Tracef("bitratecontroller: need to increase bitrate, available bandwidth %s", ThousandSeparator(int(availableBw)))
-				}
-			} else {
-				needAdjustment = bc.canDecreaseBitrate()
-				if needAdjustment {
-					bc.log.Tracef("bitratecontroller: need to decrease bitrate, available bandwidth ", ThousandSeparator(int(availableBw)))
-				}
-			}
-
-			if !needAdjustment {
-				continue
-			}
-
-			bc.fitBitratesToBandwidth(uint32(bw))
+			bc.tick()
 		}
 	}
-
 }
 
 // TODO: use video size to prioritize the video. Higher resolution video should have higher priority

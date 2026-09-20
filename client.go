@@ -20,6 +20,7 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"github.com/waj334/sfu/pkg/interceptors/playoutdelay"
+	"github.com/waj334/sfu/pkg/interceptors/twccsender"
 	"github.com/waj334/sfu/pkg/interceptors/voiceactivedetector"
 	"github.com/waj334/sfu/pkg/networkmonitor"
 	"github.com/waj334/sfu/pkg/pacer"
@@ -72,6 +73,7 @@ type ClientOptions struct {
 	IceTrickle           bool          `json:"ice_trickle"`
 	IdleTimeout          time.Duration `json:"idle_timeout"`
 	Type                 string        `json:"type"`
+	ReceiveOnly          bool          `json:"receive_only"`
 	EnableVoiceDetection bool          `json:"enable_voice_detection"`
 	EnablePlayoutDelay   bool          `json:"enable_playout_delay"`
 	EnableOpusDTX        bool          `json:"enable_opus_dtx"`
@@ -95,8 +97,40 @@ type ClientOptions struct {
 	// On unstable network, the packets can be arrived unordered which may affected the nack and packet loss counts, set this to true to allow the SFU to handle reordered packet
 	ReorderPackets bool `json:"reorder_packets"`
 	Log            logging.LeveledLogger
-	settingEngine  webrtc.SettingEngine
-	qualityLevels  []QualityLevel
+
+	// PLIGap is how long a publisher is left alone between keyframe requests.
+	// Zero uses the default. Every subscriber that attaches to a video track
+	// asks for a keyframe, so this is what stands between a room filling up
+	// and its publisher being asked for a keyframe by each arrival; a large
+	// room wants it wider than a call between two people does.
+	PLIGap time.Duration `json:"pli_gap"`
+
+	// OnPLISent is called with a publisher's SSRC each time a keyframe
+	// request is written to it, whatever asked for one. Every request goes
+	// through remoteTrack.SendPLI's gate first, so this counts what the
+	// publisher actually receives rather than what was asked for, and the two
+	// differing is the point of having it.
+	OnPLISent func(ssrc uint32)
+
+	// OnRemoteTrackChanged is called as a remote track starts and again as it
+	// ends, with true and then false.
+	//
+	// It is there to answer how many remote tracks a node is holding for one
+	// publisher and, more to the point, whether it is holding more than one
+	// for the same SSRC. Keyframe requests are addressed by SSRC and each
+	// remote track rate-limits its own, so duplicates for one SSRC multiply
+	// what reaches the publisher while every gate looks to be holding.
+	OnRemoteTrackChanged func(ssrc uint32, live bool)
+
+	// OnTWCCStats is handed the congestion-control feedback counters of a
+	// publishing client as its peer connection is built, so a caller can watch
+	// how much feedback this node is generating and whether the recorder
+	// behind it has had to be rebuilt. Never called for a receive-only client,
+	// which generates no feedback.
+	OnTWCCStats func(*twccsender.Stats)
+
+	settingEngine webrtc.SettingEngine
+	qualityLevels []QualityLevel
 }
 
 type internalDataMessage struct {
@@ -132,6 +166,12 @@ type remoteClientStats struct {
 	QualityLimitationReason string `json:"quality_limitation_reason"`
 }
 
+type senderStatItem struct {
+	sender *webrtc.RTPSender
+	ssrc   webrtc.SSRC
+	track  iClientTrack
+}
+
 type Client struct {
 	id                    string
 	name                  string
@@ -155,8 +195,7 @@ type Client struct {
 	muSending             sync.Mutex
 	isInRenegotiation     *atomic.Bool
 	isInRemoteNegotiation *atomic.Bool
-	idleTimeoutContext    context.Context
-	idleTimeoutCancel     context.CancelFunc
+	idleTimer             *time.Timer
 	mu                    sync.Mutex
 	peerConnection        *PeerConnection
 	// pending received tracks are the remote tracks from other clients that waiting to add when the client is connected
@@ -189,6 +228,8 @@ type Client struct {
 	options                        ClientOptions
 	statsGetter                    stats.Getter
 	stats                          *ClientStats
+	senderStatsMu                  sync.Mutex
+	senderStats                    []senderStatItem
 	tracks                         *trackList
 	negotiationNeeded              *atomic.Bool
 	pendingRemoteCandidates        []webrtc.ICECandidateInit
@@ -246,16 +287,22 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 	// for each PeerConnection.
 	i := &interceptor.Registry{}
 
-	if opts.EnableFlexFEC {
+	if opts.EnableFlexFEC && !opts.ReceiveOnly {
 		if err := webrtc.ConfigureFlexFEC03(126, m, i); err != nil {
 			panic(err)
 		}
 	}
 
-	// pion's default set of interceptors, with a limit on how often a lost
-	// packet is asked for. See registerInterceptors.
-	if err := registerInterceptors(m, i); err != nil {
-		panic(err)
+	if opts.ReceiveOnly {
+		if err := registerReceiveOnlyInterceptors(m, i); err != nil {
+			panic(err)
+		}
+	} else {
+		// pion's default set of interceptors, with a limit on how often a lost
+		// packet is asked for. See registerInterceptors.
+		if err := registerInterceptors(m, i, opts); err != nil {
+			panic(err)
+		}
 	}
 
 	statsInterceptorFactory, err := stats.NewInterceptor()
@@ -289,50 +336,49 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 
 	estimatorChan := make(chan cc.BandwidthEstimator, 1)
 
-	// Create a Congestion Controller. This analyzes inbound and outbound data and provides
-	// suggestions on how much we should be sending.
-	//
-	// Passing `nil` means we use the default Estimation Algorithm which is Google Congestion Control.
-	// You can use the other ones that Pion provides, or write your own!
-	congestionController, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
-		var p gcc.Pacer
-		switch opts.PacerType {
-		case PacerTypeLeakyBucket:
-			p = pacer.NewLeakyBucketPacer(opts.Log, int(s.bitrateConfigs.InitialBandwidth), false)
-		case PacerTypeNoop:
-			fallthrough
-		default:
-			p = gcc.NewNoOpPacer()
-		}
+	if !opts.ReceiveOnly {
+		// Create a Congestion Controller. This analyzes inbound and outbound data and provides
+		// suggestions on how much we should be sending.
+		congestionController, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
+			var p gcc.Pacer
+			switch opts.PacerType {
+			case PacerTypeLeakyBucket:
+				p = pacer.NewLeakyBucketPacer(opts.Log, int(s.bitrateConfigs.InitialBandwidth), false)
+			case PacerTypeNoop:
+				fallthrough
+			default:
+				p = gcc.NewNoOpPacer()
+			}
 
-		// if bw below 100_000, somehow the estimator will struggle to probe the bandwidth and will stuck there. So we set the min to 100_000
-		// TODO: we need to use packet loss based bandwidth adjuster when the bandwidth is below 100_000
-		bwe, err := gcc.NewSendSideBWE(
-			gcc.SendSideBWEInitialBitrate(int(s.bitrateConfigs.InitialBandwidth)),
-			gcc.SendSideBWEPacer(p),
-		)
+			// if bw below 100_000, somehow the estimator will struggle to probe the bandwidth and will stuck there. So we set the min to 100_000
+			// TODO: we need to use packet loss based bandwidth adjuster when the bandwidth is below 100_000
+			bwe, err := gcc.NewSendSideBWE(
+				gcc.SendSideBWEInitialBitrate(int(s.bitrateConfigs.InitialBandwidth)),
+				gcc.SendSideBWEPacer(p),
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			bwe.OnTargetBitrateChange(func(bitrate int) {
+				p.SetTargetBitrate(bitrate)
+			})
+
+			return bwe, nil
+		})
 		if err != nil {
-			return nil, err
+			panic(err)
 		}
 
-		bwe.OnTargetBitrateChange(func(bitrate int) {
-			p.SetTargetBitrate(bitrate)
+		congestionController.OnNewPeerConnection(func(id string, estimator cc.BandwidthEstimator) {
+			estimatorChan <- estimator
 		})
 
-		return bwe, nil
-	})
-	if err != nil {
-		panic(err)
-	}
+		i.Add(congestionController)
 
-	congestionController.OnNewPeerConnection(func(id string, estimator cc.BandwidthEstimator) {
-		estimatorChan <- estimator
-	})
-
-	i.Add(congestionController)
-
-	if err = webrtc.ConfigureTWCCHeaderExtensionSender(m, i); err != nil {
-		panic(err)
+		if err = webrtc.ConfigureTWCCHeaderExtensionSender(m, i); err != nil {
+			panic(err)
+		}
 	}
 
 	if opts.EnablePlayoutDelay {
@@ -503,13 +549,23 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 
 	client.bitrateController = newbitrateController(client, opts.qualityLevels)
 
-	go func() {
-		estimator := <-estimatorChan
-		client.mu.Lock()
-		defer client.mu.Unlock()
-
-		client.estimator = estimator
-	}()
+	if !opts.ReceiveOnly {
+		select {
+		case estimator := <-estimatorChan:
+			client.estimator = estimator
+		default:
+			go func() {
+				select {
+				case <-client.context.Done():
+					return
+				case estimator := <-estimatorChan:
+					client.mu.Lock()
+					client.estimator = estimator
+					client.mu.Unlock()
+				}
+			}()
+		}
+	}
 
 	// Set a handler for when a new remote track starts, this just distributes all our packets
 	// to connected peers
@@ -536,6 +592,12 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 				&rtcp.PictureLossIndication{MediaSSRC: uint32(remoteTrack.SSRC())},
 			}); err != nil {
 				client.log.Errorf("client: error write pli ", err)
+
+				return
+			}
+
+			if client.options.OnPLISent != nil {
+				client.options.OnPLISent(uint32(remoteTrack.SSRC()))
 			}
 		}
 
@@ -1174,6 +1236,10 @@ func readRTCP(r *webrtc.RTPSender, b []byte) ([]rtcp.Packet, interceptor.Attribu
 		return nil, nil, err
 	}
 
+	if attributes == nil {
+		attributes = make(interceptor.Attributes)
+	}
+
 	pkts, err := attributes.GetRTCPPackets(b[:n])
 	if err != nil {
 		b = b[:0]
@@ -1185,23 +1251,58 @@ func readRTCP(r *webrtc.RTPSender, b []byte) ([]rtcp.Packet, interceptor.Attribu
 	return pkts, attributes, nil
 }
 
-// TODO: need to improve and reduce goroutine usage
+func (c *Client) addSenderStat(sender *webrtc.RTPSender, ssrc webrtc.SSRC, track iClientTrack) {
+	c.senderStatsMu.Lock()
+	defer c.senderStatsMu.Unlock()
+	c.senderStats = append(c.senderStats, senderStatItem{
+		sender: sender,
+		ssrc:   ssrc,
+		track:  track,
+	})
+}
+
+func (c *Client) updateAllSenderStats() {
+	c.senderStatsMu.Lock()
+	if len(c.senderStats) == 0 {
+		c.senderStatsMu.Unlock()
+		return
+	}
+
+	active := c.senderStats[:0]
+	items := make([]senderStatItem, 0, len(c.senderStats))
+	for _, item := range c.senderStats {
+		if item.track != nil && item.track.Context().Err() == nil {
+			active = append(active, item)
+			items = append(items, item)
+		}
+	}
+	c.senderStats = active
+	c.senderStatsMu.Unlock()
+
+	for _, item := range items {
+		c.updateSenderStats(item.sender, item.ssrc)
+	}
+}
+
 func (c *Client) enableReportAndStats(rtpSender *webrtc.RTPSender, track iClientTrack) {
 	ssrc := rtpSender.GetParameters().Encodings[0].SSRC
+
+	c.addSenderStat(rtpSender, ssrc, track)
+
+	// Audio tracks (e.g. Opus) never receive PictureLossIndication or FullIntraRequest.
+	// Skipping this loop for non-video tracks eliminates 1 goroutine per subscribed audio track.
+	if track.Kind() != webrtc.RTPCodecTypeVideo {
+		return
+	}
+
 	go func() {
-		localCtx, cancel := context.WithCancel(track.Context())
-		defer cancel()
-
-		clientCtx, cancelClientCtx := context.WithCancel(c.context)
-		defer cancelClientCtx()
-
 		buff := make([]byte, 1500)
 
 		for {
 			select {
-			case <-clientCtx.Done():
+			case <-c.context.Done():
 				return
-			case <-localCtx.Done():
+			case <-track.Context().Done():
 				return
 			default:
 				rtcpPackets, _, err := readRTCP(rtpSender, buff)
@@ -1219,28 +1320,6 @@ func (c *Client) enableReportAndStats(rtpSender *webrtc.RTPSender, track iClient
 						track.RequestPLI()
 					}
 				}
-			}
-		}
-	}()
-
-	go func() {
-		localCtx, cancel := context.WithCancel(track.Context())
-		tick := time.NewTicker(1 * time.Second)
-		defer tick.Stop()
-
-		defer cancel()
-
-		clientCtx, cancelClientCtx := context.WithCancel(c.context)
-		defer cancelClientCtx()
-
-		for {
-			select {
-			case <-clientCtx.Done():
-				return
-			case <-localCtx.Done():
-				return
-			case <-tick.C:
-				c.updateSenderStats(rtpSender, ssrc)
 			}
 		}
 	}()
@@ -1275,7 +1354,26 @@ func (c *Client) afterClosed() {
 
 	c.dataChannels.Clear()
 
+	// Clean up subscribed client tracks: invoke onEnded to remove from remote publisher tracks
+	c.muTracks.Lock()
+	clientTracks := make([]iClientTrack, 0, len(c.clientTracks))
+	for _, track := range c.clientTracks {
+		clientTracks = append(clientTracks, track)
+	}
+	c.clientTracks = make(map[string]iClientTrack)
+	c.muTracks.Unlock()
+
+	for _, track := range clientTracks {
+		track.onEnded()
+	}
+
+	c.senderStatsMu.Lock()
+	c.senderStats = nil
+	c.senderStatsMu.Unlock()
+
 	c.onLeft()
+
+	c.cancelIdleTimeout()
 
 	c.sfu.onAfterClientStopped(c)
 
@@ -1304,6 +1402,7 @@ func (c *Client) End() error {
 	if err != nil {
 		c.log.Errorf("client: error stop client %s", err.Error())
 	}
+	c.afterClosed()
 
 	return err
 }
@@ -1421,40 +1520,36 @@ func (c *Client) startIdleTimeout(timeout time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// cancel previous timeout and start a new one
-	if c.idleTimeoutContext != nil && c.idleTimeoutContext.Err() == nil {
-		c.idleTimeoutCancel()
+	if timeout <= 0 {
+		return
 	}
 
-	go func() {
-		c.idleTimeoutContext, c.idleTimeoutCancel = context.WithTimeout(c.context, timeout)
-		<-c.idleTimeoutContext.Done()
-		if c == nil || c.idleTimeoutContext == nil || c.idleTimeoutCancel == nil {
+	// cancel previous timeout and start a new one
+	if c.idleTimer != nil {
+		c.idleTimer.Stop()
+	}
+
+	c.idleTimer = time.AfterFunc(timeout, func() {
+		if c.Context().Err() != nil {
 			return
 		}
 
-		defer c.idleTimeoutCancel()
+		c.log.Infof("client: idle timeout reached %s", c.ID())
 
-		err := c.idleTimeoutContext.Err()
-		if err != nil && err == context.DeadlineExceeded {
-			c.log.Infof("client: idle timeout reached ", c.ID)
-
-			err := c.stop()
-			if err != nil {
-				c.log.Errorf("client: error stop client ", err)
-			}
+		err := c.stop()
+		if err != nil {
+			c.log.Errorf("client: error stop client %s: %v", c.ID(), err)
 		}
-	}()
+	})
 }
 
 func (c *Client) cancelIdleTimeout() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.idleTimeoutCancel != nil {
-		c.idleTimeoutCancel()
-		c.idleTimeoutContext = nil
-		c.idleTimeoutCancel = nil
+	if c.idleTimer != nil {
+		c.idleTimer.Stop()
+		c.idleTimer = nil
 	}
 }
 
