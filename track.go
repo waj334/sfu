@@ -44,6 +44,7 @@ type baseTrack struct {
 	isScreen     *atomic.Bool // source of the track, can be media or screen
 	clientTracks *clientTrackList
 	pool         *rtppool.RTPPool
+	fanout       *trackFanout
 }
 
 type ITrack interface {
@@ -97,6 +98,7 @@ func newTrack(ctx context.Context, client *Client, trackRemote IRemoteTrack, min
 		clientTracks: ctList,
 		pool:         pool,
 	}
+	baseTrack.fanout = newTrackFanout(ctx, pool, ctList)
 
 	t := &Track{
 		mu:               sync.Mutex{},
@@ -106,16 +108,7 @@ func newTrack(ctx context.Context, client *Client, trackRemote IRemoteTrack, min
 	}
 
 	onRead := func(attrs interceptor.Attributes, p *rtp.Packet) {
-		tracks := t.base.clientTracks.GetTracks()
-
-		for _, track := range tracks {
-			//nolint:ineffassign,staticcheck // packet is from the pool
-			packet := pool.CopyPacket(p)
-
-			track.push(packet, QualityHigh)
-
-			pool.PutPacket(packet)
-		}
+		t.base.fanout.Push(p, QualityHigh)
 
 		//nolint:ineffassign // this is required
 		packet := pool.CopyPacket(p)
@@ -440,6 +433,7 @@ func newSimulcastTrack(client *Client, track IRemoteTrack, minWait, maxWait, pli
 	}
 
 	t.context, t.cancel = context.WithCancel(client.Context())
+	t.base.fanout = newTrackFanout(t.context, t.base.pool, t.base.clientTracks)
 
 	rt := t.AddRemoteTrack(track, minWait, maxWait, stats, onStatsUpdated, onPLI)
 
@@ -553,6 +547,9 @@ func (t *SimulcastTrack) AddRemoteTrack(track IRemoteTrack, minWait, maxWait tim
 
 		readTime := time.Now().UnixNano()
 
+		// Fanout now consumes this state on worker goroutines. Keep each layer's
+		// current/previous pair atomic with respect to packet rewriting.
+		t.mu.Lock()
 		switch quality {
 		case QualityHigh:
 			t.lastReadHighTS.Store(readTime)
@@ -567,16 +564,9 @@ func (t *SimulcastTrack) AddRemoteTrack(track IRemoteTrack, minWait, maxWait tim
 			t.lastLowSequence = t.lowSequence
 			t.lowSequence = p.SequenceNumber
 		}
+		t.mu.Unlock()
 
-		tracks := t.base.clientTracks.GetTracks()
-		for _, track := range tracks {
-			copyPacket := t.base.pool.CopyPacket(p)
-
-			track.push(copyPacket, quality)
-
-			t.base.pool.PutPacket(copyPacket)
-
-		}
+		t.base.fanout.Push(p, quality)
 
 		copyPacket := t.base.pool.CopyPacket(p)
 

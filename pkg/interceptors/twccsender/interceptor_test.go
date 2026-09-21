@@ -617,3 +617,52 @@ func TestDelayedStreamDoesNotDropLatePacketsOrStarveFeedback(t *testing.T) {
 	// The reports must stay compact and not explode in width
 	require.Less(t, widest, uint64(200), "feedback packet span exploded")
 }
+
+// TestUnwrapperReferenceOnlyMovesForward pins the reference this expands
+// sequence numbers against.
+//
+// Expanding a 16-bit number means choosing which turn of the counter it belongs
+// to, and the choice is made against a reference. It has to be the highest seen
+// and not the last seen: a publisher's tracks share one sequence space and are
+// read by a goroutine apiece, so arrivals interleave, and a reference that
+// follows whatever arrived last walks backwards with them. Once it has walked
+// far enough an ordinary arrival sits more than half a turn ahead of it and is
+// placed a whole turn out, 65,536 wrong, and every measure taken from it with
+// it.
+func TestUnwrapperReferenceOnlyMovesForward(t *testing.T) {
+	var u sequenceUnwrapper
+
+	for i := range 1000 {
+		u.unwrap(uint16(i)) //nolint:gosec // G115
+	}
+
+	before := u.last
+
+	// One arrival from well behind the newest, as a retransmission is.
+	got := u.unwrap(900)
+
+	require.Equal(t, int64(900), got, "a late arrival must still expand to itself")
+	require.Equal(t, before, u.last,
+		"the reference followed a late arrival backwards, from %d to %d", before, u.last)
+}
+
+// TestStreamsKeepIndependentUnwrapReferences reproduces the thousand-viewer
+// failure. One track can keep flowing while another track's reader is stalled.
+// Once their arrivals are more than half a turn apart, a connection-wide
+// reference mistakes the stalled track for a packet from the next turn.
+func TestStreamsKeepIndependentUnwrapReferences(t *testing.T) {
+	s := &SenderInterceptor{}
+
+	require.Equal(t, int64(1000), s.unwrapForStream(1, 1000))
+	require.Equal(t, int64(1001), s.unwrapForStream(2, 1001))
+
+	for sequenceNumber := 1001; sequenceNumber <= 41000; sequenceNumber++ {
+		s.unwrapForStream(1, uint16(sequenceNumber)) //nolint:gosec // G115
+	}
+
+	// Relative to the connection-wide reference, 1002 is closer to 66,538
+	// than to 1,002. Relative to stream 2's reference it is unambiguously the
+	// next packet on that stream.
+	require.Equal(t, int64(1002), s.unwrapForStream(2, 1002))
+	require.Equal(t, int64(41000), s.unwrapper.last)
+}

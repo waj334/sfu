@@ -68,6 +68,13 @@ const (
 	resyncRatio     = 3
 	resyncTolerance = 48
 
+	// Arrivals farther behind the peer connection's high-water mark than this
+	// have already had their feedback window reported. Keeping them out of the
+	// recorder prevents a stalled track from pulling feedback back into history.
+	// Ordinary packet reordering is much shallower; the load-test failure this
+	// protects against had whole tracks tens of thousands of packets behind.
+	maxLateArrival = 128
+
 	// The least time between two rebuilds.
 	//
 	// A rebuild costs the publisher that tick's feedback, which is affordable
@@ -84,7 +91,8 @@ const (
 // Stats is what the interceptor did over the life of one peer connection. It is
 // read while the interceptor is running, so every field is loaded atomically.
 type Stats struct {
-	// Recorded is arrivals handed to the recorder.
+	// Recorded is transport-wide sequence-numbered arrivals observed. This
+	// includes late arrivals deliberately kept out of the recorder.
 	Recorded atomic.Uint64
 
 	// Reported is packet arrivals described by the feedback that was sent. In
@@ -223,12 +231,13 @@ type SenderInterceptor struct {
 	// by a media read path for the length of one Record and by the feedback
 	// goroutine for the length of one build, and by nothing else; the RTCP
 	// write happens after it is let go.
-	rec            sync.Mutex
-	recorder       *Recorder
-	newestRecorded int64
-	unwrapper      sequenceUnwrapper
-	recordedSince  uint64
-	lastResync     time.Time
+	rec             sync.Mutex
+	recorder        *Recorder
+	newestRecorded  int64
+	unwrapper       sequenceUnwrapper
+	streamUnwrapper map[uint32]*sequenceUnwrapper
+	recordedSince   uint64
+	lastResync      time.Time
 
 	stats   *Stats
 	onStats func(*Stats)
@@ -359,11 +368,23 @@ func (s *SenderInterceptor) record(ssrc uint32, sequenceNumber uint16) {
 		return
 	}
 
+	// Unwrap against this stream's own last arrival. Tracks share the transport
+	// sequence space, but they are drained independently; a stalled track can
+	// therefore be more than half a 16-bit turn behind another one. A single
+	// reference cannot distinguish that from a packet 65,536 positions ahead.
+	sn := s.unwrapForStream(ssrc, sequenceNumber)
+	s.stats.Recorded.Add(1)
+
+	if s.newestRecorded > 0 && sn < s.newestRecorded-maxLateArrival {
+		s.stats.Late.Add(1)
+
+		return
+	}
+
 	// The sequence numbers between the last high-water mark and this one are
 	// packets the publisher sent. They are counted as it passes them, so an
 	// arrival that comes in behind the mark adds nothing here and reordering
 	// cannot be mistaken for the publisher sending more.
-	sn := s.unwrapper.unwrap(sequenceNumber)
 	if sn > s.newestRecorded {
 		if s.newestRecorded > 0 {
 			s.stats.Span.Add(uint64(sn - s.newestRecorded))
@@ -375,13 +396,39 @@ func (s *SenderInterceptor) record(ssrc uint32, sequenceNumber uint16) {
 	}
 
 	s.recordedSince++
-	s.stats.Recorded.Add(1)
-
-	if s.recorder.IsLate(sequenceNumber) {
-		s.stats.Late.Add(1)
-	}
 
 	s.recorder.Record(ssrc, sequenceNumber, arrival)
+}
+
+// unwrapForStream expands a transport sequence number using the last arrival
+// on the same SSRC, then places a new SSRC in the turn nearest the connection's
+// high-water mark. Per-stream references are necessary because tracks are read
+// by different goroutines and can be separated by more than half a turn even
+// though each individual track is still arriving in order.
+func (s *SenderInterceptor) unwrapForStream(ssrc uint32, sequenceNumber uint16) int64 {
+	if s.streamUnwrapper == nil {
+		s.streamUnwrapper = make(map[uint32]*sequenceUnwrapper)
+	}
+
+	u := s.streamUnwrapper[ssrc]
+	if u == nil {
+		u = &sequenceUnwrapper{}
+		if s.unwrapper.init {
+			u.init = true
+			u.last = s.unwrapper.unwrapTo(sequenceNumber, s.unwrapper.last)
+		}
+		s.streamUnwrapper[ssrc] = u
+	}
+
+	unwrapped := u.unwrap(sequenceNumber)
+	if !s.unwrapper.init {
+		s.unwrapper.init = true
+		s.unwrapper.last = unwrapped
+	} else if unwrapped > s.unwrapper.last {
+		s.unwrapper.last = unwrapped
+	}
+
+	return unwrapped
 }
 
 // buildFeedback is one tick's worth of feedback, or nothing.
@@ -517,9 +564,22 @@ func (u *sequenceUnwrapper) unwrap(sn uint16) int64 {
 		return u.last
 	}
 
-	u.last = u.unwrapTo(sn, u.last)
+	unwrapped := u.unwrapTo(sn, u.last)
 
-	return u.last
+	// The reference only ever moves forward. Expanding a sequence number means
+	// choosing which turn of the counter it belongs to, and the choice is made
+	// against a reference: move that reference back to whatever arrived last
+	// and an out-of-order packet drags it with it. A publisher's tracks share
+	// one sequence space and are read by a goroutine apiece, so arrivals
+	// interleave constantly, and a reference that follows them wanders far
+	// enough to pick the wrong turn -- adding 65,536 to every measure taken
+	// from it. Measured on a thousand-viewer run: a sequence space apparently
+	// advancing 107,000 a second for a publisher sending 227 packets a second.
+	if unwrapped > u.last {
+		u.last = unwrapped
+	}
+
+	return unwrapped
 }
 
 // unwrapTo expands sn into the wrap window nearest to reference, without

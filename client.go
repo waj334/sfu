@@ -484,6 +484,7 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 
 		switch connectionState {
 		case webrtc.PeerConnectionStateConnected:
+			client.cancelIdleTimeout()
 			if client.state.Load() == ClientStateNew {
 				client.state.Store(ClientStateActive)
 				client.onJoined()
@@ -523,7 +524,10 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		case webrtc.PeerConnectionStateFailed:
 			client.startIdleTimeout(5 * time.Second)
 		case webrtc.PeerConnectionStateConnecting:
-			client.cancelIdleTimeout()
+			// Connecting is not alive yet. Keep a deadline on half-open ICE
+			// handshakes; canceling the New-state timer here leaked peers forever
+			// when the remote side failed before this side observed Failed.
+			client.startIdleTimeout(30 * time.Second)
 		case webrtc.PeerConnectionStateDisconnected:
 			// do nothing it will idle failed or connected after a while
 		case webrtc.PeerConnectionStateNew:

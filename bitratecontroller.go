@@ -567,18 +567,29 @@ func (bc *bitrateController) getPrevQuality(quality QualityLevel) QualityLevel {
 func (bc *bitrateController) onRemoteViewedSizeChanged(videoSize videoSize) {
 	val, ok := bc.claims.Load(videoSize.TrackID)
 	if !ok {
-		// The tracks it does hold are the useful half. An empty list means the
-		// report simply arrived before the claim did; a list that holds other
-		// ids means the client is naming a track this side does not know under
-		// that name, which is a different fault entirely.
+		// The tracks it does hold are the useful half, and they decide how
+		// loudly this is worth saying. An empty list means the report simply
+		// arrived before the claim did, which is a race every client runs and
+		// every client wins on its next report -- the channel it reports over
+		// opens before the subscription behind the claim is finished. A list
+		// that holds other ids means the client is naming a track this side
+		// does not know under that name, which is a fault and stays an error.
 		held := make([]string, 0)
 		bc.claims.Range(func(key, _ any) bool {
 			held = append(held, key.(string))
 			return true
 		})
 
+		if len(held) == 0 {
+			bc.log.Debugf("bitrate: client %s reported a viewed size for track %s before it held any claim",
+				bc.client.ID(), videoSize.TrackID)
+
+			return
+		}
+
 		bc.log.Errorf("bitrate: client %s reported a viewed size for track %s it holds no claim on; claims held: %v",
 			bc.client.ID(), videoSize.TrackID, held)
+
 		return
 	}
 
