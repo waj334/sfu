@@ -3,6 +3,7 @@ package sfu
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/pion/rtp"
 	"github.com/waj334/sfu/pkg/rtppool"
@@ -16,8 +17,31 @@ import (
 // multiply payload memory by the subscriber count.
 const fanoutQueueDepth = 512
 
+type sharedPacket struct {
+	packet rtp.Packet
+	buf    []byte
+	refs   atomic.Int32
+	pool   *sync.Pool
+}
+
+func (s *sharedPacket) release() {
+	if s.refs.Add(-1) == 0 {
+		s.packet.Header = rtp.Header{}
+		s.packet.Payload = nil
+		s.pool.Put(s)
+	}
+}
+
+var sharedPacketPool = &sync.Pool{
+	New: func() any {
+		return &sharedPacket{
+			buf: make([]byte, 1500),
+		}
+	},
+}
+
 type fanoutJob struct {
-	packet  *rtp.Packet
+	shared  *sharedPacket
 	quality QualityLevel
 }
 
@@ -69,30 +93,67 @@ func (f *trackFanout) remove(track iClientTrack) {
 // to every subscriber independently. A slow subscriber can fill only its own
 // queue; it cannot stall ingress or discard another viewer's frames.
 func (f *trackFanout) Push(packet *rtp.Packet, quality QualityLevel) {
-	shared := &rtp.Packet{Header: packet.Header.Clone(), Payload: append([]byte(nil), packet.Payload...)}
-	job := fanoutJob{packet: shared, quality: quality}
-
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	if len(f.workers) == 0 {
+		return
+	}
+
+	shared := sharedPacketPool.Get().(*sharedPacket)
+	shared.pool = sharedPacketPool
+
+	shared.packet.Header = packet.Header.Clone()
+
+	payloadLen := len(packet.Payload)
+	if cap(shared.buf) < payloadLen {
+		shared.buf = make([]byte, payloadLen)
+	}
+	shared.buf = shared.buf[:payloadLen]
+	copy(shared.buf, packet.Payload)
+	shared.packet.Payload = shared.buf
+
+	// 1 initial reference for Push during distribution
+	shared.refs.Store(1)
+
+	job := fanoutJob{shared: shared, quality: quality}
+
 	for _, worker := range f.workers {
+		shared.refs.Add(1)
 		select {
 		case worker.queue <- job:
 		default:
 			// This subscriber is already behind. Keep every other subscriber
 			// flowing and, most importantly, keep draining publisher ingress.
+			shared.refs.Add(-1)
 		}
 	}
+
+	// Release Push's initial reference; if no subscriber took the job, it returns to pool.
+	shared.release()
 }
 
 func (f *trackFanout) run(ctx context.Context, worker *fanoutWorker) {
+	defer func() {
+		// Drain any remaining jobs in the queue to release their packet references
+		for {
+			select {
+			case job := <-worker.queue:
+				job.shared.release()
+			default:
+				return
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case job := <-worker.queue:
-			packet := f.pool.CopyPacket(job.packet)
+			packet := f.pool.CopyPacket(&job.shared.packet)
 			worker.track.push(packet, job.quality)
 			f.pool.PutPacket(packet)
+			job.shared.release()
 		}
 	}
 }

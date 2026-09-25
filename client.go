@@ -26,6 +26,10 @@ import (
 	"github.com/waj334/sfu/pkg/pacer"
 )
 
+var (
+	opusRtpmapRegex = regexp.MustCompile(`a=rtpmap:(\d+) opus\/`)
+)
+
 type ClientState int
 type ClientType string
 
@@ -897,55 +901,36 @@ func (c *Client) Negotiate(offer webrtc.SessionDescription) (*webrtc.SessionDesc
 }
 
 func (c *Client) setOpusSDP(sdp webrtc.SessionDescription) webrtc.SessionDescription {
-	if c.options.EnableOpusDTX {
-		var regex, err = regexp.Compile(`a=rtpmap:(\d+) opus\/(\d+)\/(\d+)`)
-		if err != nil {
-			c.log.Errorf("client: error on compile regex ", err)
-			return sdp
-		}
-		var opusLine = regex.FindString(sdp.SDP)
+	if c.options.EnableOpusDTX || c.options.EnableOpusInbandFEC {
+		submatch := opusRtpmapRegex.FindStringSubmatch(sdp.SDP)
+		if len(submatch) >= 2 {
+			opusNo := submatch[1]
+			prefix := "a=fmtp:" + opusNo + " "
+			startIdx := strings.Index(sdp.SDP, prefix)
+			if startIdx != -1 {
+				endIdx := strings.IndexByte(sdp.SDP[startIdx:], '\n')
+				var fmtpLine string
+				if endIdx == -1 {
+					fmtpLine = sdp.SDP[startIdx:]
+				} else {
+					fmtpLine = sdp.SDP[startIdx : startIdx+endIdx]
+				}
+				fmtpLine = strings.TrimRight(fmtpLine, "\r")
 
-		if opusLine == "" {
-			c.log.Errorf("client: error opus line not found")
-			return sdp
-		}
+				var newFmtpLine = ""
 
-		regex, err = regexp.Compile(`(\d+)`)
-		if err != nil {
-			c.log.Errorf("client: error on compile regex ", err)
-			return sdp
-		}
+				if c.options.EnableOpusDTX && !strings.Contains(fmtpLine, "usedtx=1") {
+					newFmtpLine += ";usedtx=1"
+				}
 
-		var opusNo = regex.FindString(opusLine)
-		if opusNo == "" {
-			c.log.Errorf("client: error opus no not found")
-			return sdp
-		}
+				if c.options.EnableOpusInbandFEC && !strings.Contains(fmtpLine, "useinbandfec=1") {
+					newFmtpLine += ";useinbandfec=1"
+				}
 
-		fmtpRegex, err := regexp.Compile(`a=fmtp:` + opusNo + ` .+`)
-		if err != nil {
-			c.log.Errorf("client: error on compile regex ", err)
-			return sdp
-		}
-
-		var fmtpLine = fmtpRegex.FindString(sdp.SDP)
-		if fmtpLine == "" {
-			c.log.Errorf("client: error fmtp line not found")
-			return sdp
-		}
-
-		var newFmtpLine = ""
-
-		if c.options.EnableOpusDTX && !strings.Contains(fmtpLine, "usedtx=1") {
-			newFmtpLine += ";usedtx=1"
-		}
-
-		if c.options.EnableOpusInbandFEC && !strings.Contains(fmtpLine, "useinbandfec=1") {
-			newFmtpLine += ";useinbandfec=1"
-		}
-
-		if newFmtpLine != "" {
-			sdp.SDP = strings.Replace(sdp.SDP, fmtpLine, fmtpLine+newFmtpLine, -1)
+				if newFmtpLine != "" {
+					sdp.SDP = strings.Replace(sdp.SDP, fmtpLine, fmtpLine+newFmtpLine, 1)
+				}
+			}
 		}
 	}
 
@@ -1001,10 +986,14 @@ func (c *Client) renegotiate(offerFlexFec bool) {
 		}()
 
 		for c.negotiationNeeded.Load() {
-			timout, cancel := context.WithTimeout(c.context, 100*time.Millisecond)
-			defer cancel()
-
-			<-timout.Done()
+			timer := time.NewTimer(100 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-c.context.Done():
+				timer.Stop()
+				return
+			}
+			timer.Stop()
 
 			// mark negotiation is not needed after this done, so it will out of the loop
 			c.negotiationNeeded.Store(false)
@@ -1015,6 +1004,11 @@ func (c *Client) renegotiate(offerFlexFec bool) {
 				c.peerConnection.PC().ConnectionState() == webrtc.PeerConnectionStateConnected {
 
 				if c.onRenegotiation == nil {
+					return
+				}
+
+				if hasDanglingSenders(c.peerConnection.PC()) {
+					c.log.Debugf("sfu: skipping renegotiate for %s: has dangling senders with no track", c.ID())
 					return
 				}
 
@@ -1074,7 +1068,16 @@ func (c *Client) renegotiate(offerFlexFec bool) {
 			}
 		}
 	}()
+}
 
+func hasDanglingSenders(pc *webrtc.PeerConnection) bool {
+	for _, transceiver := range pc.GetTransceivers() {
+		if transceiver.Direction() == webrtc.RTPTransceiverDirectionSendonly &&
+			(transceiver.Sender() == nil || transceiver.Sender().Track() == nil) {
+			return true
+		}
+	}
+	return false
 }
 
 // OnAllowedRemoteRenegotiation event is called when the SFU is done with the renegotiation

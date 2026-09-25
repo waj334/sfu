@@ -273,17 +273,117 @@ func TestKeyframeGateOnlyAppliesToCodecsItCanRead(t *testing.T) {
 		webrtc.MimeTypeVP9,
 		webrtc.MimeTypeAV1,
 		webrtc.MimeTypeH264,
+		webrtc.MimeTypeH265,
 		"VIDEO/VP8", // the comparison is case insensitive, as SDP is
 	} {
 		require.True(t, detectsKeyframes(mimeType), mimeType)
 	}
 
 	for _, mimeType := range []string{
-		webrtc.MimeTypeH265,
 		webrtc.MimeTypeOpus,
 		"video/some-codec-from-the-future",
 		"",
 	} {
 		require.False(t, detectsKeyframes(mimeType), mimeType)
 	}
+}
+
+func TestKeyframe_H265(t *testing.T) {
+	// Single NAL unit packets
+	// IDR_W_RADL (19)
+	idrPayload := []byte{byte(19 << 1), 0x01, 0xAA, 0xBB}
+	isKey, ok := Keyframe(webrtc.MimeTypeH265, idrPayload)
+	require.True(t, ok)
+	require.True(t, isKey)
+
+	// Case insensitive check with "video/hevc"
+	isKey, ok = Keyframe("video/hevc", idrPayload)
+	require.True(t, ok)
+	require.True(t, isKey)
+
+	// IDR_N_LP (20)
+	idrNLP := []byte{byte(20 << 1), 0x01, 0xAA}
+	isKey, ok = Keyframe(webrtc.MimeTypeH265, idrNLP)
+	require.True(t, ok)
+	require.True(t, isKey)
+
+	// CRA_NUT (21)
+	craPayload := []byte{byte(21 << 1), 0x01, 0xAA}
+	isKey, ok = Keyframe(webrtc.MimeTypeH265, craPayload)
+	require.True(t, ok)
+	require.True(t, isKey)
+
+	// VPS (32)
+	vpsPayload := []byte{byte(32 << 1), 0x01, 0xAA}
+	isKey, ok = Keyframe(webrtc.MimeTypeH265, vpsPayload)
+	require.True(t, ok)
+	require.True(t, isKey)
+
+	// SPS (33)
+	spsPayload := []byte{byte(33 << 1), 0x01, 0xAA}
+	isKey, ok = Keyframe(webrtc.MimeTypeH265, spsPayload)
+	require.True(t, ok)
+	require.True(t, isKey)
+
+	// Non-IRAP TRAIL_R (1)
+	nonKeyPayload := []byte{byte(1 << 1), 0x01, 0xAA}
+	isKey, ok = Keyframe(webrtc.MimeTypeH265, nonKeyPayload)
+	require.True(t, ok)
+	require.False(t, isKey)
+
+	// PPS (34)
+	ppsPayload := []byte{byte(34 << 1), 0x01, 0xAA}
+	isKey, ok = Keyframe(webrtc.MimeTypeH265, ppsPayload)
+	require.True(t, ok)
+	require.False(t, isKey)
+
+	// Corrupted F bit set
+	corrupted := []byte{0x80 | byte(19 << 1), 0x01}
+	isKey, ok = Keyframe(webrtc.MimeTypeH265, corrupted)
+	require.False(t, ok)
+	require.False(t, isKey)
+
+	// Aggregation Packet (AP, type 48) containing IDR
+	// AP header (2 bytes) + 2-byte len + NALU
+	apWithIDR := []byte{
+		byte(48 << 1), 0x01, // AP header
+		0x00, 0x03, byte(1 << 1), 0x01, 0x00, // unit 1: TRAIL_R
+		0x00, 0x03, byte(19 << 1), 0x01, 0x00, // unit 2: IDR
+	}
+	isKey, ok = Keyframe(webrtc.MimeTypeH265, apWithIDR)
+	require.True(t, ok)
+	require.True(t, isKey)
+
+	// Aggregation Packet (AP, type 48) without keyframe
+	apWithoutIDR := []byte{
+		byte(48 << 1), 0x01, // AP header
+		0x00, 0x03, byte(1 << 1), 0x01, 0x00, // unit 1: TRAIL_R
+	}
+	isKey, ok = Keyframe(webrtc.MimeTypeH265, apWithoutIDR)
+	require.True(t, ok)
+	require.False(t, isKey)
+
+	// Fragmentation Unit (FU, type 49)
+	// Start of IDR fragment (S bit = 1, fuType = 19)
+	fuStartIDR := []byte{byte(49 << 1), 0x01, 0x80 | 19, 0xAA}
+	isKey, ok = Keyframe(webrtc.MimeTypeH265, fuStartIDR)
+	require.True(t, ok)
+	require.True(t, isKey)
+
+	// Continuation of IDR fragment (S bit = 0, fuType = 19)
+	fuContIDR := []byte{byte(49 << 1), 0x01, 19, 0xAA}
+	isKey, ok = Keyframe(webrtc.MimeTypeH265, fuContIDR)
+	require.True(t, ok)
+	require.False(t, isKey)
+
+	// Start of non-keyframe fragment (S bit = 1, fuType = 1)
+	fuStartNonKey := []byte{byte(49 << 1), 0x01, 0x80 | 1, 0xAA}
+	isKey, ok = Keyframe(webrtc.MimeTypeH265, fuStartNonKey)
+	require.True(t, ok)
+	require.False(t, isKey)
+
+	// Short payload
+	isKey, ok = Keyframe(webrtc.MimeTypeH265, []byte{0x01})
+	require.False(t, ok)
+	require.False(t, isKey)
 }

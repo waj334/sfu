@@ -1,93 +1,74 @@
 package sfu
 
-// import (
-// 	"log"
-// 	"testing"
+import (
+	"testing"
 
-// 	"github.com/stretchr/testify/require"
-// )
+	"github.com/pion/logging"
+	"github.com/stretchr/testify/require"
+)
 
-// // 65526, 65527, 65527, 65526, 65532, 65531, 65533, 65534, 65535, 1, 2, 3, 4, 5, 65528, 65529, 65530, 0, 6, 7, 8, 9, 10
-// // 65526 1 1
-// // 65527 1 1
-// // 65528 1 1
-// // 65529 1 1
-// // 65530 1 1
-// // 65531 2 1 ==> updscale ( don't upscale because the next packet already sent)
-// // 65532 2 1
-// // 65533 2 1
-// // 65534 2 1
-// // 65535 2 1
-// // 0 2 1
-// // 1 2 1
-// // 2 2 1
-// // 3 2 1
-// // 4 2 1
-// // 5 3 3 upscale
-// // 6 3 3
-// // 7 3 3
-// // 8 3 3
-// // 9 3 3
-// // 10 3 3
-// func TestAddCache(t *testing.T) {
-// 	t.Parallel()
+func TestPacketCachesInOrder(t *testing.T) {
+	t.Parallel()
+	logger := logging.NewDefaultLoggerFactory().NewLogger("test")
+	pc := newPacketCaches(logger)
 
-// 	caches := newPacketCaches()
+	for seq := uint16(100); seq < 110; seq++ {
+		pc.Add(seq, 100, 1000, 1, 1, 1, 1)
+	}
 
-// 	currentTID := uint8(1)
-// 	currentSID := uint8(1)
+	require.Equal(t, 10, len(pc.caches))
+	for i := 0; i < 10; i++ {
+		require.Equal(t, uint16(100+i), pc.caches[i].SeqNum)
+	}
 
-// 	var sid, tid uint8
-// 	var err error
+	require.True(t, pc.IsAllowToUpscaleDownscale(110))
+	require.False(t, pc.IsAllowToUpscaleDownscale(105))
+}
 
-// 	for i, unsorted := range unsortedNumbers {
-// 		if unsorted < 65531 && unsorted > 65525 {
-// 			if unsorted == 65526 || unsorted == 65527 {
-// 				_, tid, sid, err = caches.GetDecision(unsorted, 65526, currentSID, currentTID)
-// 				if i > 1 {
-// 					require.Equal(t, err, ErrDuplicate)
-// 				}
-// 			} else if unsorted == 65531 {
-// 				_, tid, sid, err = caches.GetDecision(unsorted, 65526, currentSID, currentTID)
-// 				require.Equal(t, err, ErrCantDecide)
-// 			} else {
-// 				_, tid, sid, err = caches.GetDecision(unsorted, 65526, currentSID, currentTID)
-// 				require.NoError(t, err, "Error should be nil for sequence number %d", unsorted)
-// 			}
+func TestPacketCachesOutOfOrderAndWrap(t *testing.T) {
+	t.Parallel()
+	logger := logging.NewDefaultLoggerFactory().NewLogger("test")
+	pc := newPacketCaches(logger)
 
-// 			if unsorted > 65526 {
-// 				require.Equal(t, uint8(1), tid, "TID should be 3 for sequence number %d", unsorted, tid)
-// 				require.Equal(t, uint8(1), sid, "SID should be 3 for sequence number %d", unsorted, sid)
-// 			}
-// 			caches.Add(unsorted, 65526, uint8(1), uint8(1))
-// 		} else if unsorted > 4 && unsorted < 11 {
-// 			if unsorted == 5 {
-// 				_, tid, sid, err = caches.GetDecision(unsorted, 65526, currentSID, currentTID)
-// 			} else {
-// 				_, tid, sid, err = caches.GetDecision(unsorted, 65526, currentSID, currentTID)
-// 			}
-// 			require.NoError(t, err)
-// 			if unsorted > 5 {
-// 				require.Equal(t, uint8(3), tid, "TID should be 3 for sequence number %d", unsorted, tid)
-// 				require.Equal(t, uint8(3), sid, "SID should be 3 for sequence number %d", unsorted, sid)
-// 			}
-// 			caches.Add(unsorted, 65526, uint8(3), uint8(3))
-// 		} else {
+	// Add sequence numbers around the wrap boundary: 65534, 0, 65535, 1
+	seqs := []uint16{65534, 0, 65535, 1}
+	for _, seq := range seqs {
+		pc.Add(seq, 65534, 1000, 1, 1, 1, 1)
+	}
 
-// 			if unsorted > 65530 || unsorted < 5 {
-// 				require.Equal(t, uint8(1), tid, "TID should be 3 for sequence number %d", unsorted, tid)
-// 				require.Equal(t, uint8(1), sid, "SID should be 3 for sequence number %d", unsorted, sid)
-// 			}
+	require.Equal(t, 4, len(pc.caches))
+	expected := []uint16{65534, 65535, 0, 1}
+	for i, exp := range expected {
+		require.Equal(t, exp, pc.caches[i].SeqNum)
+	}
+}
 
-// 			caches.Add(unsorted, uint8(1), uint8(1))
-// 		}
-// 	}
+func TestPacketCachesDuplicates(t *testing.T) {
+	t.Parallel()
+	logger := logging.NewDefaultLoggerFactory().NewLogger("test")
+	pc := newPacketCaches(logger)
 
-// 	i := 0
-// 	for e := caches.caches.Front(); e != nil; e = e.Next() {
-// 		cache := e.Value.(Cache)
-// 		require.Equal(t, sortedNumbers[i], cache.SeqNum)
-// 		log.Println("Cache: ", cache.SeqNum, cache.TID, cache.SID)
-// 		i++
-// 	}
-// }
+	pc.Add(10, 10, 1000, 1, 1, 1, 1)
+	pc.Add(10, 10, 1000, 1, 1, 1, 1) // duplicate, should be skipped
+	require.Equal(t, 1, len(pc.caches))
+
+	_, _, _, err := pc.GetDecision(10, 10, 1, 1)
+	require.Equal(t, ErrDuplicate, err)
+}
+
+func TestPacketCachesSizeLimit(t *testing.T) {
+	t.Parallel()
+	logger := logging.NewDefaultLoggerFactory().NewLogger("test")
+	pc := newPacketCaches(logger)
+	pc.Size = 5 // smaller size for test
+
+	for seq := uint16(1); seq <= 10; seq++ {
+		pc.Add(seq, 1, 1000, 1, 1, 1, 1)
+	}
+
+	require.Equal(t, 5, len(pc.caches))
+	expected := []uint16{6, 7, 8, 9, 10}
+	for i, exp := range expected {
+		require.Equal(t, exp, pc.caches[i].SeqNum)
+	}
+}

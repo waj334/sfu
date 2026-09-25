@@ -1,7 +1,6 @@
 package sfu
 
 import (
-	"container/list"
 	"errors"
 	"sync"
 
@@ -10,7 +9,7 @@ import (
 
 type packetCaches struct {
 	mu     sync.RWMutex
-	caches *list.List
+	caches []Cache
 	init   bool
 	Size   uint16
 	log    logging.LeveledLogger
@@ -45,7 +44,7 @@ var (
 func newPacketCaches(log logging.LeveledLogger) *packetCaches {
 	return &packetCaches{
 		mu:     sync.RWMutex{},
-		caches: &list.List{},
+		caches: make([]Cache, 0, 1024),
 		init:   false,
 		Size:   1000,
 		log:    log,
@@ -57,8 +56,9 @@ func (p *packetCaches) Add(seqNum, baseSequence uint16, ts uint32, psid, tsid, s
 	defer func() {
 		p.mu.Unlock()
 
-		if uint16(p.caches.Len()) > p.Size {
-			p.caches.Remove(p.caches.Front())
+		if uint16(len(p.caches)) > p.Size {
+			copy(p.caches, p.caches[1:])
+			p.caches = p.caches[:len(p.caches)-1]
 		}
 	}()
 
@@ -72,32 +72,38 @@ func (p *packetCaches) Add(seqNum, baseSequence uint16, ts uint32, psid, tsid, s
 		SID:       sid,
 	}
 
-	if p.caches.Len() == 0 {
-		p.caches.PushBack(newCache)
+	if len(p.caches) == 0 {
+		p.caches = append(p.caches, newCache)
 
 		return
 	}
 
 	// add packet in order
 Loop:
-	for e := p.caches.Back(); e != nil; e = e.Prev() {
-		currentCache := e.Value.(Cache)
+	for i := len(p.caches) - 1; i >= 0; i-- {
+		currentCache := p.caches[i]
 		if currentCache.SeqNum == seqNum {
 			p.log.Warnf("packet cache: packet sequence ", seqNum, " already exists in the cache, will not adding the packet")
 
 			return
 		}
 
-		if currentCache.SeqNum < seqNum && seqNum-currentCache.SeqNum < uint16SizeHalf {
-			p.caches.InsertAfter(newCache, e)
+		if (currentCache.SeqNum < seqNum && seqNum-currentCache.SeqNum < uint16SizeHalf) ||
+			(currentCache.SeqNum-seqNum > uint16SizeHalf) {
+			insertIdx := i + 1
+			if insertIdx == len(p.caches) {
+				p.caches = append(p.caches, newCache)
+			} else {
+				p.caches = append(p.caches, Cache{})
+				copy(p.caches[insertIdx+1:], p.caches[insertIdx:])
+				p.caches[insertIdx] = newCache
+			}
 
 			break Loop
-		} else if currentCache.SeqNum-seqNum > uint16SizeHalf {
-			p.caches.InsertAfter(newCache, e)
-
-			break Loop
-		} else if e.Prev() == nil {
-			p.caches.PushFront(newCache)
+		} else if i == 0 {
+			p.caches = append(p.caches, Cache{})
+			copy(p.caches[1:], p.caches[:len(p.caches)-1])
+			p.caches[0] = newCache
 
 			break Loop
 		}
@@ -111,8 +117,8 @@ func (p *packetCaches) GetDecision(currentSeqNum, currentBaseSeq uint16, current
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	for e := p.caches.Back(); e != nil; e = e.Prev() {
-		currentCache := e.Value.(Cache)
+	for i := len(p.caches) - 1; i >= 0; i-- {
+		currentCache := p.caches[i]
 		if currentCache.SeqNum == currentSeqNum {
 			return currentBaseSeq, currentSID, currentTID, ErrDuplicate
 		}
@@ -126,13 +132,13 @@ func (p *packetCaches) GetDecision(currentSeqNum, currentBaseSeq uint16, current
 
 		if currentCache.SeqNum < currentSeqNum &&
 			currentCache.SeqNum-currentSeqNum > uint16SizeHalf && currentSeqNum-currentCache.SeqNum > 1 {
-			// next packet is has a gap, can't decide keep the current SID and TID
+			// next packet has a gap, can't decide keep the current SID and TID
 			return currentCache.BaseSeq, currentCache.SID, currentCache.TID, ErrCantDecide
 		}
 	}
 
 	// can't decide could be because the cache is empty
-	if p.caches.Len() == 0 {
+	if len(p.caches) == 0 {
 		return currentBaseSeq, currentSID, currentTID, ErrCantDecide
 	}
 
@@ -140,18 +146,13 @@ func (p *packetCaches) GetDecision(currentSeqNum, currentBaseSeq uint16, current
 }
 
 func (p *packetCaches) IsAllowToUpscaleDownscale(seqNum uint16) bool {
-	if p.caches.Back() == nil {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if len(p.caches) == 0 {
 		return true
 	}
 
-	cache, ok := p.caches.Back().Value.(Cache)
-	if !ok {
-		return false
-	}
-
-	if cache.SeqNum < seqNum {
-		return true
-	}
-
-	return false
+	cache := p.caches[len(p.caches)-1]
+	return cache.SeqNum < seqNum
 }

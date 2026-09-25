@@ -298,6 +298,70 @@ func Keyframe(codec string, payload []byte) (bool, bool) {
 			return (payload[1]&0x1F == 7), true
 		}
 		return false, false
+	} else if strings.EqualFold(codec, "video/h265") || strings.EqualFold(codec, "video/hevc") {
+		if len(payload) < 2 {
+			return false, false
+		}
+		// H.265 NAL Unit Header is 2 bytes:
+		// F (1 bit), Type (6 bits), LayerId (6 bits), TID (3 bits)
+		// RFC 7798 section 1.1.4
+		if (payload[0] & 0x80) != 0 {
+			// F bit must be zero
+			return false, false
+		}
+		naluType := (payload[0] >> 1) & 0x3F
+
+		isKeyframeType := func(t uint8) bool {
+			// IRAP pictures:
+			// 16: BLA_W_LP, 17: BLA_W_RADL, 18: BLA_N_LP
+			// 19: IDR_W_RADL, 20: IDR_N_LP
+			// 21: CRA_NUT
+			// Parameter sets:
+			// 32: VPS_NUT, 33: SPS_NUT
+			return t == 32 || t == 33 || (t >= 16 && t <= 21)
+		}
+
+		if naluType <= 47 {
+			// Simple NALU
+			return isKeyframeType(naluType), true
+		} else if naluType == 48 {
+			// Aggregation Packet (AP)
+			i := 2
+			for i < len(payload) {
+				if i+2 > len(payload) {
+					return false, false
+				}
+				length := int(payload[i])<<8 | int(payload[i+1])
+				i += 2
+				if i+length > len(payload) {
+					return false, false
+				}
+				if length >= 2 {
+					unitType := (payload[i] >> 1) & 0x3F
+					if isKeyframeType(unitType) {
+						return true, true
+					}
+				}
+				i += length
+			}
+			if i == len(payload) {
+				return false, true
+			}
+			return false, false
+		} else if naluType == 49 {
+			// Fragmentation Unit (FU)
+			if len(payload) < 3 {
+				return false, false
+			}
+			fuHeader := payload[2]
+			if (fuHeader & 0x80) == 0 {
+				// not a starting fragment
+				return false, true
+			}
+			fuType := fuHeader & 0x3F
+			return isKeyframeType(fuType), true
+		}
+		return false, false
 	}
 	return false, false
 }

@@ -195,6 +195,7 @@ func detectsKeyframes(mimeType string) bool {
 		webrtc.MimeTypeVP9,
 		webrtc.MimeTypeAV1,
 		webrtc.MimeTypeH264,
+		webrtc.MimeTypeH265,
 	} {
 		if strings.EqualFold(mimeType, known) {
 			return true
