@@ -3,6 +3,7 @@ package sfu
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -153,8 +154,27 @@ func (t *Track) Context() context.Context {
 	return t.context
 }
 
+// streamIDForKind ensures video and audio tracks use separate stream IDs (e.g. "loadtest-video" and "loadtest-audio").
+// This prevents WebRTC receive clients from placing both tracks into the same synchronization group (RtpStreamsSynchronizer),
+// which otherwise causes cyclic 80ms playout delay adjustments and out-of-order frame discards whenever audio NetEq fluctuates
+// or video quality layers switch.
+func streamIDForKind(baseStreamID string, kind webrtc.RTPCodecType) string {
+	base := strings.TrimSuffix(strings.TrimSuffix(baseStreamID, "-video"), "-audio")
+	if base == "" {
+		if kind == webrtc.RTPCodecTypeAudio {
+			return "audio"
+		}
+		return "video"
+	}
+	if kind == webrtc.RTPCodecTypeAudio {
+		return base + "-audio"
+	}
+	return base + "-video"
+}
+
 func (t *Track) createLocalTrack() *webrtc.TrackLocalStaticRTP {
-	track, newTrackErr := webrtc.NewTrackLocalStaticRTP(t.remoteTrack.track.Codec().RTPCodecCapability, t.base.id, t.base.streamid)
+	streamID := streamIDForKind(t.base.streamid, t.base.kind)
+	track, newTrackErr := webrtc.NewTrackLocalStaticRTP(t.remoteTrack.track.Codec().RTPCodecCapability, t.base.id, streamID)
 	if newTrackErr != nil {
 		panic(newTrackErr)
 	}
@@ -166,7 +186,8 @@ func (t *Track) createOpusLocalTrack() *webrtc.TrackLocalStaticRTP {
 	c := t.remoteTrack.track.Codec().RTPCodecCapability
 	c.MimeType = webrtc.MimeTypeOpus
 	c.SDPFmtpLine = "minptime=10;useinbandfec=1"
-	track, newTrackErr := webrtc.NewTrackLocalStaticRTP(c, t.base.id, t.base.streamid)
+	streamID := streamIDForKind(t.base.streamid, webrtc.RTPCodecTypeAudio)
+	track, newTrackErr := webrtc.NewTrackLocalStaticRTP(c, t.base.id, streamID)
 	if newTrackErr != nil {
 		panic(newTrackErr)
 	}

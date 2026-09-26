@@ -21,10 +21,11 @@ const (
 )
 
 type bitrateClaim struct {
-	mu        sync.RWMutex
-	track     iClientTrack
-	quality   QualityLevel
-	simulcast bool
+	mu                sync.RWMutex
+	track             iClientTrack
+	quality           QualityLevel
+	simulcast         bool
+	lastQualityChange time.Time
 }
 
 func (c *bitrateClaim) Quality() QualityLevel {
@@ -39,6 +40,14 @@ func (c *bitrateClaim) SetQuality(quality QualityLevel) {
 	defer c.mu.Unlock()
 
 	c.quality = quality
+	c.lastQualityChange = time.Now()
+}
+
+func (c *bitrateClaim) LastQualityChange() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.lastQualityChange
 }
 
 func (c *bitrateClaim) SendBitrate() uint32 {
@@ -498,6 +507,9 @@ func (bc *bitrateController) fitBitratesToBandwidth(bw uint32) {
 				quality := claim.Quality()
 				if claim.IsAdjustable() &&
 					quality == QualityLevel(i) {
+					if !claim.LastQualityChange().IsZero() && time.Since(claim.LastQualityChange()) < 5*time.Second {
+						continue
+					}
 					oldBitrate := claim.SendBitrate()
 					if oldBitrate == 0 {
 						continue
@@ -531,16 +543,20 @@ func (bc *bitrateController) fitBitratesToBandwidth(bw uint32) {
 				if claim.IsAdjustable() &&
 					quality == QualityLevel(i) &&
 					quality < claim.track.MaxQuality() {
+					if !claim.LastQualityChange().IsZero() && time.Since(claim.LastQualityChange()) < 5*time.Second {
+						continue
+					}
 					oldBitrate := claim.SendBitrate()
 
 					newQuality := bc.getNextQuality(quality)
 					newBitrate := claim.QualityLevelToBitrate(newQuality)
 					bitrateIncrease := newBitrate - oldBitrate
 
-					// check if the bitrate increase will more than the available bandwidth
+					// check if the bitrate increase will exceed available bandwidth with a 15% headroom margin
 					newSentBitrates := totalSentBitrates + bitrateIncrease
-					if newSentBitrates > bw {
-						bc.log.Tracef("bitratecontroller: can't increase, new bitrates %s not fit to bandwidth %s", ThousandSeparator(int(newSentBitrates)), ThousandSeparator(int(bw)))
+					targetWithHeadroom := newSentBitrates * 115 / 100
+					if targetWithHeadroom > bw {
+						bc.log.Tracef("bitratecontroller: can't increase, headroom requirement %s not fit to bandwidth %s", ThousandSeparator(int(targetWithHeadroom)), ThousandSeparator(int(bw)))
 						return
 					}
 

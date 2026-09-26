@@ -56,7 +56,8 @@ type simulcastClientTrack struct {
 }
 
 func newSimulcastClientTrack(c *Client, t *SimulcastTrack) *simulcastClientTrack {
-	track, newTrackErr := webrtc.NewTrackLocalStaticRTP(t.base.codec.RTPCodecCapability, t.base.id, t.base.streamid)
+	streamID := streamIDForKind(t.base.streamid, webrtc.RTPCodecTypeVideo)
+	track, newTrackErr := webrtc.NewTrackLocalStaticRTP(t.base.codec.RTPCodecCapability, t.base.id, streamID)
 	if newTrackErr != nil {
 		panic(newTrackErr)
 	}
