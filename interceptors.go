@@ -3,9 +3,9 @@ package sfu
 import (
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/nack"
-	"github.com/pion/interceptor/pkg/report"
 	"github.com/pion/webrtc/v4"
 
+	"github.com/waj334/sfu/pkg/interceptors/senderreport"
 	"github.com/waj334/sfu/pkg/interceptors/twccsender"
 )
 
@@ -47,7 +47,10 @@ func registerInterceptors(m *webrtc.MediaEngine, i *interceptor.Registry, opts C
 	i.Add(responder)
 	i.Add(generator)
 
-	if err := webrtc.ConfigureRTCPReports(i); err != nil {
+	// senderreport rather than webrtc.ConfigureRTCPReports: uses custom SenderInterceptor
+	// that anchors NTP/RTP directly to packet arrivals and enforces monotonicity across reports,
+	// preventing "Newer RTCP SR report with older RTP timestamp, dropping" warnings under high load.
+	if err := senderreport.ConfigureRTCPReports(i); err != nil {
 		return err
 	}
 
@@ -75,12 +78,13 @@ func registerInterceptors(m *webrtc.MediaEngine, i *interceptor.Registry, opts C
 //
 // In addition, NACK responder is omitted for viewers to prevent NACK storms under large
 // viewer counts (1,000+). Viewers rely on PLI/FIR keyframe requests rather than individual
-// packet retransmissions. RTCP Sender Reports are retained for media synchronization.
+// packet retransmissions. RTCP Sender Reports are retained for media synchronization,
+// using custom senderreport interceptor to enforce strict monotonicity without extrapolation drift.
 func registerReceiveOnlyInterceptors(m *webrtc.MediaEngine, i *interceptor.Registry) error {
 	m.RegisterFeedback(webrtc.RTCPFeedback{Type: "nack", Parameter: "pli"}, webrtc.RTPCodecTypeVideo)
 	m.RegisterFeedback(webrtc.RTCPFeedback{Type: "ccm", Parameter: "fir"}, webrtc.RTPCodecTypeVideo)
 
-	sender, err := report.NewSenderInterceptor()
+	sender, err := senderreport.NewSenderInterceptor()
 	if err != nil {
 		return err
 	}
