@@ -15,13 +15,49 @@ import (
 // burst drops the same keyframe for every subscriber and produces synchronized
 // stutter. Jobs share one immutable packet copy, so this capacity does not
 // multiply payload memory by the subscriber count.
-const fanoutQueueDepth = 512
+// Simulcast access units arrive as packet bursts, not evenly over their frame
+// duration. The bundled 720p fixture has 175 RTP packets in one keyframe and
+// all three aligned layers total about 238. A queue smaller than an access-unit
+// burst drops the same keyframe for every subscriber and produces synchronized
+// stutter. Jobs share one immutable packet copy, so this capacity does not
+// multiply payload memory by the subscriber count.
+const fanoutQueueDepth = 1024
+
+type qualityFilteredTrack interface {
+	wantsQuality(QualityLevel) bool
+}
 
 type sharedPacket struct {
-	packet rtp.Packet
-	buf    []byte
-	refs   atomic.Int32
-	pool   *sync.Pool
+	packet     rtp.Packet
+	buf        []byte
+	extensions []rtp.Extension
+	csrc       []uint32
+	refs       atomic.Int32
+	pool       *sync.Pool
+}
+
+func (s *sharedPacket) copyHeader(h *rtp.Header) {
+	s.packet.Header = *h
+	if len(h.Extensions) > 0 {
+		if cap(s.extensions) < len(h.Extensions) {
+			s.extensions = make([]rtp.Extension, len(h.Extensions))
+		}
+		s.extensions = s.extensions[:len(h.Extensions)]
+		copy(s.extensions, h.Extensions)
+		s.packet.Header.Extensions = s.extensions
+	} else {
+		s.packet.Header.Extensions = nil
+	}
+	if len(h.CSRC) > 0 {
+		if cap(s.csrc) < len(h.CSRC) {
+			s.csrc = make([]uint32, len(h.CSRC))
+		}
+		s.csrc = s.csrc[:len(h.CSRC)]
+		copy(s.csrc, h.CSRC)
+		s.packet.Header.CSRC = s.csrc
+	} else {
+		s.packet.Header.CSRC = nil
+	}
 }
 
 func (s *sharedPacket) release() {
@@ -35,7 +71,9 @@ func (s *sharedPacket) release() {
 var sharedPacketPool = &sync.Pool{
 	New: func() any {
 		return &sharedPacket{
-			buf: make([]byte, 1500),
+			buf:        make([]byte, 1500),
+			extensions: make([]rtp.Extension, 0, 4),
+			csrc:       make([]uint32, 0, 4),
 		}
 	},
 }
@@ -102,7 +140,7 @@ func (f *trackFanout) Push(packet *rtp.Packet, quality QualityLevel) {
 	shared := sharedPacketPool.Get().(*sharedPacket)
 	shared.pool = sharedPacketPool
 
-	shared.packet.Header = packet.Header.Clone()
+	shared.copyHeader(&packet.Header)
 
 	payloadLen := len(packet.Payload)
 	if cap(shared.buf) < payloadLen {
@@ -118,6 +156,12 @@ func (f *trackFanout) Push(packet *rtp.Packet, quality QualityLevel) {
 	job := fanoutJob{shared: shared, quality: quality}
 
 	for _, worker := range f.workers {
+		if qf, ok := worker.track.(qualityFilteredTrack); ok {
+			if !qf.wantsQuality(quality) {
+				continue
+			}
+		}
+
 		shared.refs.Add(1)
 		select {
 		case worker.queue <- job:

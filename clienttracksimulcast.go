@@ -45,6 +45,13 @@ type simulcastClientTrack struct {
 	packetmapMid            *packetmap.Map
 	packetmapLow            *packetmap.Map
 	onTrackEndedCallbacks   []func()
+	targetQuality           atomic.Uint32
+	lastInboundHighSeq      uint16
+	lastInboundMidSeq       uint16
+	lastInboundLowSeq       uint16
+	hasInboundHighSeq       bool
+	hasInboundMidSeq        bool
+	hasInboundLowSeq        bool
 }
 
 func newSimulcastClientTrack(c *Client, t *SimulcastTrack) *simulcastClientTrack {
@@ -112,6 +119,7 @@ func newSimulcastClientTrack(c *Client, t *SimulcastTrack) *simulcastClientTrack
 		packetmapLow:            &packetmap.Map{},
 	}
 
+	ct.targetQuality.Store(uint32(QualityHigh))
 	ct.SetMaxQuality(QualityHigh)
 
 	ct.remoteTrack.sendPLI()
@@ -236,21 +244,38 @@ func canStartForwarding(forwarding, target, quality QualityLevel, isKeyframe, ma
 // use has not been read from in 500ms. A publisher pausing its top layer — which
 // libwebrtc does routinely under CPU or bandwidth pressure — therefore switched
 // the subscriber onto the low layer at whatever packet happened to arrive next.
+func (t *simulcastClientTrack) wantsQuality(quality QualityLevel) bool {
+	forwarding := Uint32ToQualityLevel(t.forwardedQuality.Load())
+	if forwarding == quality {
+		return true
+	}
+	target := layerFor(Uint32ToQualityLevel(t.targetQuality.Load()))
+	if target == QualityNone {
+		target = QualityLow
+	}
+	return quality == target
+}
+
 func (t *simulcastClientTrack) push(p *rtp.Packet, quality QualityLevel) {
-	if !t.client.bitrateController.Exist(t.ID()) {
-		// do nothing if the bitrate claim is not exist
+	forwarding := Uint32ToQualityLevel(t.forwardedQuality.Load())
+	target := layerFor(Uint32ToQualityLevel(t.targetQuality.Load()))
+	if target == QualityNone {
+		target = layerFor(t.getQuality())
+		if target == QualityNone {
+			target = QualityLow
+		}
+	}
+
+	// Fast path: if the subscriber is already forwarding this layer and it is
+	// the target layer, send immediately without querying bitrate claims or maps.
+	if forwarding == quality && target == forwarding {
+		t.send(p, quality)
 		return
 	}
 
-	forwarding := Uint32ToQualityLevel(t.forwardedQuality.Load())
-
-	// getQuality steps off a layer the publisher has stopped sending on its own,
-	// so this is a layer that exists and not merely one that is wanted.
-	target := layerFor(t.getQuality())
-	if target == QualityNone {
-		// TODO: figure out what to do if the target quality is none
-		// probably we should send a blank frame
-		target = QualityLow
+	if t.client != nil && t.client.bitrateController != nil && !t.client.bitrateController.Exist(t.ID()) {
+		// do nothing if the bitrate claim is not exist
+		return
 	}
 
 	if forwarding != target && quality == target {
@@ -271,7 +296,9 @@ func (t *simulcastClientTrack) push(p *rtp.Packet, quality QualityLevel) {
 		opensAFrame := !t.detectsKeyframes || IsKeyframe(t.mimeType, p.Payload)
 
 		if canStartForwarding(forwarding, target, quality, opensAFrame, mapped) {
-			t.client.log.Tracef("track: %s forwarding quality %d in place of %d", t.id, target, forwarding)
+			if t.client != nil && t.client.log != nil {
+				t.client.log.Tracef("track: %s forwarding quality %d in place of %d", t.id, target, forwarding)
+			}
 
 			forwarding = target
 			t.forwardedQuality.Store(uint32(forwarding))
@@ -394,6 +421,7 @@ func (t *simulcastClientTrack) SetMaxQuality(quality QualityLevel) {
 			claim.SetQuality(quality)
 		}
 	}
+	_ = t.getQuality()
 
 	t.remoteTrack.sendPLI()
 }
@@ -442,17 +470,33 @@ func (t *simulcastClientTrack) rewritePacket(p *rtp.Packet, quality QualityLevel
 	t.rewriteMu.Lock()
 	defer t.rewriteMu.Unlock()
 
-	t.remoteTrack.mu.RLock()
 	sequenceDelta := uint16(0)
 	switch quality {
 	case QualityHigh:
-		sequenceDelta = t.remoteTrack.highSequence - t.remoteTrack.lastHighSequence
+		if t.hasInboundHighSeq {
+			sequenceDelta = p.SequenceNumber - t.lastInboundHighSeq
+		} else {
+			sequenceDelta = p.SequenceNumber
+			t.hasInboundHighSeq = true
+		}
+		t.lastInboundHighSeq = p.SequenceNumber
 	case QualityMid:
-		sequenceDelta = t.remoteTrack.midSequence - t.remoteTrack.lastMidSequence
+		if t.hasInboundMidSeq {
+			sequenceDelta = p.SequenceNumber - t.lastInboundMidSeq
+		} else {
+			sequenceDelta = p.SequenceNumber
+			t.hasInboundMidSeq = true
+		}
+		t.lastInboundMidSeq = p.SequenceNumber
 	case QualityLow:
-		sequenceDelta = t.remoteTrack.lowSequence - t.remoteTrack.lastLowSequence
+		if t.hasInboundLowSeq {
+			sequenceDelta = p.SequenceNumber - t.lastInboundLowSeq
+		} else {
+			sequenceDelta = p.SequenceNumber
+			t.hasInboundLowSeq = true
+		}
+		t.lastInboundLowSeq = p.SequenceNumber
 	}
-	t.remoteTrack.mu.RUnlock()
 
 	if previous := Uint32ToQualityLevel(t.lastSentQuality.Load()); previous != QualityNone && previous != quality {
 		// A switch lands on a keyframe, so this packet opens the frame after the
@@ -552,6 +596,7 @@ func (t *simulcastClientTrack) getQuality() QualityLevel {
 	claim := t.Client().bitrateController.GetClaim(t.ID())
 
 	if claim == nil {
+		t.targetQuality.Store(uint32(QualityNone))
 		return QualityNone
 	}
 
@@ -559,18 +604,22 @@ func (t *simulcastClientTrack) getQuality() QualityLevel {
 
 	if quality != QualityNone && !track.isTrackActive(quality) {
 		if quality != QualityLow && track.isTrackActive(QualityLow) {
+			t.targetQuality.Store(uint32(QualityLow))
 			return QualityLow
 		}
 
 		if quality != QualityMid && track.isTrackActive(QualityMid) {
+			t.targetQuality.Store(uint32(QualityMid))
 			return QualityMid
 		}
 
 		if quality != QualityHigh && track.isTrackActive(QualityHigh) {
+			t.targetQuality.Store(uint32(QualityHigh))
 			return QualityHigh
 		}
 	}
 
+	t.targetQuality.Store(uint32(quality))
 	return quality
 }
 

@@ -547,9 +547,6 @@ func (t *SimulcastTrack) AddRemoteTrack(track IRemoteTrack, minWait, maxWait tim
 
 		readTime := time.Now().UnixNano()
 
-		// Fanout now consumes this state on worker goroutines. Keep each layer's
-		// current/previous pair atomic with respect to packet rewriting.
-		t.mu.Lock()
 		switch quality {
 		case QualityHigh:
 			t.lastReadHighTS.Store(readTime)
@@ -564,7 +561,6 @@ func (t *SimulcastTrack) AddRemoteTrack(track IRemoteTrack, minWait, maxWait tim
 			t.lastLowSequence = t.lowSequence
 			t.lowSequence = p.SequenceNumber
 		}
-		t.mu.Unlock()
 
 		t.base.fanout.Push(p, quality)
 
@@ -708,9 +704,6 @@ func (t *SimulcastTrack) TotalTracks() int {
 
 // track is considered active if the track is not nil and the latest read operation was 500ms ago
 func (t *SimulcastTrack) isTrackActive(quality QualityLevel) bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
 	// set max active track threshold to 500ms
 	threshold := time.Duration(500) * time.Millisecond
 

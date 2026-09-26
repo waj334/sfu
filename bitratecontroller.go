@@ -179,6 +179,9 @@ func (bc *bitrateController) setQuality(clientTrackID string, quality QualityLev
 		claim.SetQuality(quality)
 
 		bc.claims.Store(clientTrackID, claim)
+		if claim.track != nil {
+			_ = claim.track.Quality()
+		}
 	}
 }
 

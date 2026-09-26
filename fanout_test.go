@@ -152,3 +152,49 @@ func TestFanoutQueueFull(t *testing.T) {
 	// Worker should have received up to fanoutQueueDepth items without deadlock or panic
 	require.Greater(t, track.received.Load(), int32(0))
 }
+
+type dummyFilteredTrack struct {
+	dummyClientTrack
+	wanted QualityLevel
+}
+
+func (d *dummyFilteredTrack) wantsQuality(q QualityLevel) bool {
+	return q == d.wanted
+}
+
+func TestFanoutLayerFiltering(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pool := rtppool.New()
+	tracks := newClientTrackList()
+	fanout := newTrackFanout(ctx, pool, tracks)
+
+	var wg sync.WaitGroup
+	wg.Add(5) // only expect 5 High packets
+
+	highViewer := &dummyFilteredTrack{
+		dummyClientTrack: dummyClientTrack{
+			id: "high-viewer",
+			onPush: func(p *rtp.Packet, q QualityLevel) {
+				require.Equal(t, QualityLevel(QualityHigh), q)
+				wg.Done()
+			},
+		},
+		wanted: QualityHigh,
+	}
+	tracks.Add(highViewer)
+
+	// Send 5 High, 5 Mid, 5 Low
+	for i := 0; i < 5; i++ {
+		fanout.Push(&rtp.Packet{Header: rtp.Header{SequenceNumber: uint16(i + 1)}}, QualityHigh)
+		fanout.Push(&rtp.Packet{Header: rtp.Header{SequenceNumber: uint16(i + 10)}}, QualityMid)
+		fanout.Push(&rtp.Packet{Header: rtp.Header{SequenceNumber: uint16(i + 20)}}, QualityLow)
+	}
+
+	wg.Wait()
+	time.Sleep(30 * time.Millisecond)
+
+	// The high viewer must have received only 5 packets, completely skipping the 10 Mid/Low packets
+	require.Equal(t, int32(5), highViewer.received.Load())
+}

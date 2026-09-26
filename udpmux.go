@@ -18,8 +18,8 @@ func NewUDPMux(ctx context.Context, port int) *UDPMux {
 	localCtx, cancel := context.WithCancel(ctx)
 
 	opts := []ice.UDPMuxFromPortOption{
-		ice.UDPMuxFromPortWithReadBufferSize(25_000_000),
-		ice.UDPMuxFromPortWithWriteBufferSize(25_000_000),
+		ice.UDPMuxFromPortWithReadBufferSize(67_108_864),
+		ice.UDPMuxFromPortWithWriteBufferSize(67_108_864),
 		ice.UDPMuxFromPortWithNetworks(ice.NetworkTypeUDP4),
 		ice.UDPMuxFromPortWithLoopback(),
 		ice.UDPMuxFromPortWithInterfaceFilter(func(name string) bool {
