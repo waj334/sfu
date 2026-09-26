@@ -734,6 +734,39 @@ func (t *SimulcastTrack) isTrackActive(quality QualityLevel) bool {
 	return false
 }
 
+func (t *SimulcastTrack) sendPLIQuality(quality QualityLevel) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	switch quality {
+	case QualityHigh, QualityHighMid, QualityHighLow:
+		if t.remoteTrackHigh != nil {
+			t.remoteTrackHigh.SendPLI()
+			return
+		}
+	case QualityMid, QualityMidMid, QualityMidLow:
+		if t.remoteTrackMid != nil {
+			t.remoteTrackMid.SendPLI()
+			return
+		}
+	case QualityLow, QualityLowMid, QualityLowLow:
+		if t.remoteTrackLow != nil {
+			t.remoteTrackLow.SendPLI()
+			return
+		}
+	}
+
+	if t.remoteTrackHigh != nil {
+		t.remoteTrackHigh.SendPLI()
+	}
+	if t.remoteTrackMid != nil {
+		t.remoteTrackMid.SendPLI()
+	}
+	if t.remoteTrackLow != nil {
+		t.remoteTrackLow.SendPLI()
+	}
+}
+
 func (t *SimulcastTrack) sendPLI() {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

@@ -44,6 +44,7 @@ type simulcastClientTrack struct {
 	packetmapHigh           *packetmap.Map
 	packetmapMid            *packetmap.Map
 	packetmapLow            *packetmap.Map
+	lastPLIRequest          *atomic.Int64
 	onTrackEndedCallbacks   []func()
 	targetQuality           atomic.Uint32
 	lastInboundHighSeq      uint16
@@ -117,19 +118,20 @@ func newSimulcastClientTrack(c *Client, t *SimulcastTrack) *simulcastClientTrack
 		packetmapHigh:           &packetmap.Map{},
 		packetmapMid:            &packetmap.Map{},
 		packetmapLow:            &packetmap.Map{},
+		lastPLIRequest:          &atomic.Int64{},
 	}
 
 	ct.targetQuality.Store(uint32(QualityHigh))
 	ct.SetMaxQuality(QualityHigh)
 
-	ct.remoteTrack.sendPLI()
+	ct.requestPLI(QualityHigh)
 
 	// A layer that turns up later is one this subscriber may want to move onto,
 	// and it can only move on a keyframe. Registered once here rather than on
 	// the first packet forwarded, which is where it used to live and so never
 	// ran for a track whose first packet had not arrived yet.
 	ct.remoteTrack.onRemoteTrackAdded(func(remote *remoteTrack) {
-		ct.remoteTrack.sendPLI()
+		ct.requestPLI(ct.Quality())
 	})
 
 	t.OnEnded(func() {
@@ -304,11 +306,10 @@ func (t *simulcastClientTrack) push(p *rtp.Packet, quality QualityLevel) {
 			t.forwardedQuality.Store(uint32(forwarding))
 			t.lastQuality.Store(uint32(forwarding))
 		} else {
-			// Nothing to switch on yet. This is the first packet of all as well,
-			// where nothing is being forwarded and the track has not started: it
-			// starts on a keyframe or it does not start. remoteTrack throttles
-			// these to one every 250ms, so asking on every packet costs nothing.
-			t.remoteTrack.sendPLI()
+			// Throttle keyframe requests while waiting for the target layer's opening keyframe,
+			// requesting at most once every 2 seconds specifically on the target layer
+			// rather than spamming all layers on every delta packet.
+			t.requestPLI(target)
 		}
 	}
 
@@ -423,7 +424,7 @@ func (t *simulcastClientTrack) SetMaxQuality(quality QualityLevel) {
 	}
 	_ = t.getQuality()
 
-	t.remoteTrack.sendPLI()
+	t.requestPLI(quality)
 }
 
 func (t *simulcastClientTrack) MaxQuality() QualityLevel {
@@ -587,7 +588,21 @@ func (t *simulcastClientTrack) frameDuration() uint32 {
 }
 
 func (t *simulcastClientTrack) RequestPLI() {
-	t.remoteTrack.sendPLI()
+	t.requestPLI(t.Quality())
+}
+
+func (t *simulcastClientTrack) requestPLI(quality QualityLevel) {
+	now := t.now().UnixNano()
+	last := t.lastPLIRequest.Load()
+	if last > 0 && time.Duration(now-last) < 2*time.Second {
+		return
+	}
+	t.lastPLIRequest.Store(now)
+	if quality != QualityNone {
+		t.remoteTrack.sendPLIQuality(quality)
+	} else {
+		t.remoteTrack.sendPLI()
+	}
 }
 
 func (t *simulcastClientTrack) getQuality() QualityLevel {

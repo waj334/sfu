@@ -305,8 +305,12 @@ func (stream *senderStream) processRTP(now time.Time, header *rtp.Header, payloa
 	if stream.useLatestPacket || stream.packetCount == 0 || (diff > 0 && diff < (1<<15)) {
 		// Told to consider every packet, or this was the first packet, or it's in-order
 		stream.lastRTPSN = header.SequenceNumber
-		stream.lastRTPTimeRTP = header.Timestamp
-		stream.lastRTPTimeTime = now
+		// Anchor timestamp only on the first packet of a frame to prevent multi-packet
+		// transmission delay within a frame from skewing the RTP-to-NTP clock estimator.
+		if header.Timestamp != stream.lastRTPTimeRTP || stream.packetCount == 0 {
+			stream.lastRTPTimeRTP = header.Timestamp
+			stream.lastRTPTimeTime = now
+		}
 	}
 
 	stream.packetCount++
