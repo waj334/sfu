@@ -245,6 +245,10 @@ func (bc *bitrateController) addStaticVideoClaims(clientTracks []iClientTrack) (
 
 // calculate the quality level for each track based on the available bandwidth and max bitrate of tracks
 func (bc *bitrateController) qualityLevelPerTrack(clientTracks []iClientTrack) QualityLevel {
+	if bc.client.estimator == nil {
+		return QualityHigh
+	}
+
 	maxBitrate := uint32(0)
 
 	for _, clientTrack := range clientTracks {
@@ -422,6 +426,13 @@ func (bc *bitrateController) canIncreaseBitrate(availableBw uint32) bool {
 }
 
 func (bc *bitrateController) tick() {
+	if bc.client.estimator == nil {
+		// When no dynamic bandwidth estimator is active for this client (e.g. receive-only viewers),
+		// do not dynamically throttle or decrease bitrates against a static fallback bandwidth.
+		// Quality for these clients is determined by client-signaled viewed size (onRemoteViewedSizeChanged).
+		return
+	}
+
 	var needAdjustment bool
 
 	totalSendBitrates := bc.totalSentBitrates()
@@ -615,12 +626,15 @@ func (bc *bitrateController) onRemoteViewedSizeChanged(videoSize videoSize) {
 	if videoSize.Width*videoSize.Height < bc.client.sfu.bitrateConfigs.VideoLowPixels {
 		bc.log.Debugf("bitrate: track %s video size is low, set max quality to low", videoSize.TrackID)
 		claim.track.SetMaxQuality(QualityLow)
+		claim.SetQuality(QualityLow)
 	} else if videoSize.Width*videoSize.Height < bc.client.sfu.bitrateConfigs.VideoMidPixels {
 		bc.log.Infof("bitrate: track %s video size is mid, set max quality to mid", videoSize.TrackID)
 		claim.track.SetMaxQuality(QualityMid)
+		claim.SetQuality(QualityMid)
 	} else {
 		bc.log.Infof("bitrate: track %s video size is high, set max quality to high", videoSize.TrackID)
 		claim.track.SetMaxQuality(QualityHigh)
+		claim.SetQuality(QualityHigh)
 	}
 }
 
