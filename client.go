@@ -276,6 +276,7 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 	m := &webrtc.MediaEngine{}
 
 	opts.settingEngine.EnableSCTPZeroChecksum(true)
+	opts.settingEngine.SetReceiveMTU(65535)
 
 	if err := RegisterCodecs(m, s.codecs); err != nil {
 		panic(err)
