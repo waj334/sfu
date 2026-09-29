@@ -149,21 +149,28 @@ func (r *Room) AddExtension(extension IExtension) {
 // All clients will get `connectionstateevent` with `closed` state.
 // https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/connectionstatechange_event
 func (r *Room) Close() error {
+	// Marked closed before anything else, and the callbacks run without the
+	// lock. A callback may close the room itself (an extension tearing down its
+	// own state does), and that second Close used to take the read lock again
+	// from inside the first: with StopClient's write lock queued in between, the
+	// second read waited on the writer, the writer on the first read, and the
+	// room — and every join, leave and stats read behind it — hung for good.
+	r.mu.Lock()
 	if r.state == StateRoomClosed {
+		r.mu.Unlock()
 		return ErrRoomIsClosed
 	}
+	r.state = StateRoomClosed
+	callbacks := append([]func(id string){}, r.onRoomClosedCallbacks...)
+	r.mu.Unlock()
 
 	r.cancel()
 
 	r.sfu.Stop()
 
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	for _, callback := range r.onRoomClosedCallbacks {
+	for _, callback := range callbacks {
 		callback(r.id)
 	}
-
-	r.state = StateRoomClosed
 
 	return nil
 }
