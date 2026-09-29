@@ -964,14 +964,14 @@ func (c *Client) renegotiate(offerFlexFec bool) {
 	}
 
 	if c.isInRemoteNegotiation.Load() {
-		c.log.Infof("sfu: renegotiation is delayed because the remote client %s is doing negotiation ", c.ID)
+		c.log.Infof("sfu: renegotiation is delayed because the remote client %s is doing negotiation ", c.ID())
 
 		return
 	}
 
 	// no need to run another negotiation if it's already in progress, it will rerun because we mark the negotiationneeded to true
 	if c.isInRenegotiation.Load() {
-		c.log.Infof("sfu: renegotiation is delayed because the client %s is doing negotiation ", c.ID)
+		c.log.Infof("sfu: renegotiation is delayed because the client %s is doing negotiation ", c.ID())
 		return
 	}
 
@@ -1008,8 +1008,8 @@ func (c *Client) renegotiate(offerFlexFec bool) {
 					return
 				}
 
-				if hasDanglingSenders(c.peerConnection.PC()) {
-					c.log.Debugf("sfu: skipping renegotiate for %s: has dangling senders with no track", c.ID())
+				if hasDanglingSenders(c.peerConnection.PC()) && !c.hasPendingNegotiation() {
+					c.log.Debugf("sfu: skipping renegotiate for %s: has dangling senders with no pending changes", c.ID())
 					return
 				}
 
@@ -1078,6 +1078,32 @@ func hasDanglingSenders(pc *webrtc.PeerConnection) bool {
 			return true
 		}
 	}
+	return false
+}
+
+func (c *Client) hasPendingNegotiation() bool {
+	pc := c.peerConnection.PC()
+	localDesc := pc.CurrentLocalDescription()
+	if localDesc == nil {
+		return true
+	}
+
+	// 1. Check if there are data channels that are not yet in the local SDP.
+	if c.dataChannels.Length() > 0 && !strings.Contains(localDesc.SDP, "m=application") {
+		return true
+	}
+
+	// 2. Check if any current client track is missing from the local SDP.
+	c.muTracks.Lock()
+	defer c.muTracks.Unlock()
+
+	for _, ct := range c.clientTracks {
+		lt := ct.LocalTrack()
+		if lt != nil && !strings.Contains(localDesc.SDP, lt.ID()) {
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -1214,6 +1240,7 @@ func (c *Client) setClientTrack(t ITrack) iClientTrack {
 		}
 
 		c.peerConnection.PC().RemoveTrack(sender)
+		c.renegotiate(false)
 	})
 
 	// enable RTCP report and stats
@@ -1222,6 +1249,8 @@ func (c *Client) setClientTrack(t ITrack) iClientTrack {
 	c.muTracks.Lock()
 	c.clientTracks[outputTrack.ID()] = outputTrack
 	c.muTracks.Unlock()
+
+	c.renegotiate(false)
 
 	return outputTrack
 }
@@ -1746,6 +1775,8 @@ func (c *Client) createDataChannel(label string, initOpts *webrtc.DataChannelIni
 	c.sfu.setupMessageForwarder(c.ID(), newDc)
 	c.dataChannels.Add(newDc)
 
+	c.renegotiate(false)
+
 	return nil
 }
 
@@ -1757,6 +1788,8 @@ func (c *Client) createInternalDataChannel(label string, msgCallback func(msg we
 	}
 
 	newDc.OnMessage(msgCallback)
+
+	c.renegotiate(false)
 
 	return newDc, nil
 }

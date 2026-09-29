@@ -143,3 +143,10 @@ func (d *DataChannelList) Clear() {
 		delete(d.dataChannels, label)
 	}
 }
+
+func (d *DataChannelList) Length() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return len(d.dataChannels)
+}
