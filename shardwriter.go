@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/ipv4"
 )
@@ -60,6 +61,10 @@ type outboundPacket struct {
 	buf  *[]byte
 	n    int
 	addr net.Addr
+
+	// queued is when it was queued, for how long packets wait: the signal
+	// egress shedding steps viewers down on.
+	queued time.Time
 }
 
 const (
@@ -152,7 +157,7 @@ func (w *shardWriter) enqueue(p []byte, addr net.Addr) (int, error) {
 		buf = &b
 	}
 	n := copy(*buf, p)
-	pkt := outboundPacket{buf: buf, n: n, addr: addr}
+	pkt := outboundPacket{buf: buf, n: n, addr: addr, queued: time.Now()}
 
 	for {
 		select {
@@ -226,6 +231,8 @@ func (w *shardWriter) sendQueued(batches int) {
 			return
 		}
 
+		// The first is the oldest: the queue is first in, first out.
+		noteQueueWait(time.Since(pending[0].queued))
 		w.send(pending)
 
 		for i := range pending {

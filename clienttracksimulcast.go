@@ -53,6 +53,10 @@ type simulcastClientTrack struct {
 	hasInboundHighSeq       bool
 	hasInboundMidSeq        bool
 	hasInboundLowSeq        bool
+
+	// shedRank is where this viewer falls in the order egress shedding steps
+	// viewers down in; see shedCap.
+	shedRank int32
 }
 
 func newSimulcastClientTrack(c *Client, t *SimulcastTrack) *simulcastClientTrack {
@@ -123,6 +127,9 @@ func newSimulcastClientTrack(c *Client, t *SimulcastTrack) *simulcastClientTrack
 	}
 
 	ct.targetQuality.Store(uint32(QualityHigh))
+	if c != nil {
+		ct.shedRank = shedRank(c.ID())
+	}
 	ct.SetMaxQuality(QualityHigh)
 
 	ct.requestPLI(QualityHigh)
@@ -256,7 +263,7 @@ func (t *simulcastClientTrack) wantsQuality(quality QualityLevel) bool {
 	if target == QualityNone {
 		target = QualityLow
 	}
-	return quality == target
+	return quality == min(target, shedCap(t.shedRank))
 }
 
 func (t *simulcastClientTrack) push(p *rtp.Packet, quality QualityLevel) {
@@ -268,6 +275,9 @@ func (t *simulcastClientTrack) push(p *rtp.Packet, quality QualityLevel) {
 			target = QualityLow
 		}
 	}
+	// Stepped down while the node cannot send everything on time: see
+	// egressshed.go. The switch waits for a keyframe, like any other.
+	target = min(target, shedCap(t.shedRank))
 
 	// Fast path: if the subscriber is already forwarding this layer and it is
 	// the target layer, send immediately without querying bitrate claims or maps.

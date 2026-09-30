@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/pion/ice/v4"
 	"github.com/pion/logging"
@@ -47,7 +49,25 @@ type UDPMuxOptions struct {
 	// pooled buffer per packet per socket while a node is behind, and packets
 	// that wait longer in it.
 	WriteQueueDepth int
+
+	// ShedTargetDelay is how long packets may wait in the send queues before
+	// viewers are stepped down a simulcast layer to bring the load back under
+	// what the node can send; see egressshed.go. 0 (or less) leaves shedding
+	// off; DefaultShedTargetDelay is the suggested target.
+	//
+	// Off by default because it only helps a node limited by bandwidth. One
+	// limited by how many sends the kernel can make a second is not relieved:
+	// a low layer frame is one packet where a high layer one merged five into
+	// a single segmented send, and audio, never shed, is a send of its own
+	// fifty times a second per viewer. At 4,000 viewers stepping everyone to
+	// the low layer halved the packets, cut the kernel's sends by 14%, and left
+	// packets waiting longer than before.
+	ShedTargetDelay time.Duration
 }
+
+// shedControllerRunning keeps shedding to one controller a process: the shares
+// it sets are the process's.
+var shedControllerRunning atomic.Bool
 
 // NewUDPMux is ice.NewMultiUDPMuxFromPort with each address served by several
 // sockets rather than one. See shardedPacketConn.
@@ -80,6 +100,13 @@ func NewUDPMuxWithOptions(ctx context.Context, port int, opts UDPMuxOptions) *UD
 	}
 
 	mux := ice.NewMultiUDPMuxDefault(muxes...)
+
+	if target := opts.ShedTargetDelay; target > 0 && shedControllerRunning.CompareAndSwap(false, true) {
+		go func() {
+			defer shedControllerRunning.Store(false)
+			runShedController(localCtx, target)
+		}()
+	}
 
 	go func() {
 		defer mux.Close()
