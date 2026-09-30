@@ -26,8 +26,22 @@ func New() *RTPPool {
 	}
 }
 
+// PutPacket returns p to the pool.
+//
+// The packet keeps its extension and CSRC storage, emptied, so that the next
+// packet parsed or copied into it fills that rather than allocating: once per
+// packet a host sends and once per viewer per packet to copy it, which was a
+// large share of the node's garbage. A pooled packet always owns that storage
+// (Unmarshal appends into its own, CopyPacket copies into it), so nothing
+// else is pointing into it.
 func (r *RTPPool) PutPacket(p *rtp.Packet) {
+	extensions := p.Header.Extensions[:cap(p.Header.Extensions)]
+	clear(extensions) // drop the references into the payloads they came from
+	csrc := p.Header.CSRC[:0]
+
 	*p = rtp.Packet{}
+	p.Header.Extensions = extensions[:0]
+	p.Header.CSRC = csrc
 	r.pool.Put(p)
 }
 
@@ -35,9 +49,20 @@ func (r *RTPPool) PutPacket(p *rtp.Packet) {
 // The returned packet MUST be returned to the pool via PutPacket when done.
 // WARNING: Do not use the returned packet across goroutine boundaries without additional synchronization.
 // WARNING: Do not hold references to the packet after calling PutPacket.
+//
+// The extensions and CSRCs are copied into the packet's own storage rather than
+// shared with p's: a copy that shared them would, back in the pool, let the
+// next packet parsed into it overwrite p's, and a copy that grew them (the TWCC
+// interceptor adds an extension to every packet sent) could write into p's
+// spare capacity, which every other subscriber's copy of p shares too.
 func (r *RTPPool) CopyPacket(p *rtp.Packet) *rtp.Packet {
 	newPacket := r.GetPacket()
+	extensions := newPacket.Header.Extensions[:0]
+	csrc := newPacket.Header.CSRC[:0]
+
 	*newPacket = *p
+	newPacket.Header.Extensions = append(extensions, p.Header.Extensions...)
+	newPacket.Header.CSRC = append(csrc, p.Header.CSRC...)
 
 	return newPacket
 }
