@@ -74,6 +74,11 @@ var (
 )
 
 type ClientOptions struct {
+	// AudioPTime, when set, asks a client for audio packets this long, by an
+	// a=ptime in the answer to its offer: see withAudioPTime. 0 leaves it to
+	// the client (20ms for libwebrtc).
+	AudioPTime time.Duration `json:"audio_ptime"`
+
 	IceTrickle           bool          `json:"ice_trickle"`
 	IdleTimeout          time.Duration `json:"idle_timeout"`
 	Type                 string        `json:"type"`
@@ -842,6 +847,7 @@ func (c *Client) Negotiate(offer webrtc.SessionDescription) (*webrtc.SessionDesc
 		c.log.Errorf("client: error create answer ", err)
 		return nil, err
 	}
+	answer.SDP = withAudioPTime(answer.SDP, c.options.AudioPTime)
 
 	var gatherComplete <-chan struct{}
 
