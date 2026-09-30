@@ -29,6 +29,9 @@ import (
 type shardedPacketConn struct {
 	conns []*net.UDPConn
 
+	// One per socket: what WriteTo has queued for it, sent in batches.
+	writers []*shardWriter
+
 	packets chan shardedPacket
 	done    chan struct{}
 
@@ -79,6 +82,7 @@ func listenSharded(addr *net.UDPAddr, shards int, readBuffer, writeBuffer int) (
 
 	c := &shardedPacketConn{
 		conns:   make([]*net.UDPConn, 0, shards),
+		writers: make([]*shardWriter, 0, shards),
 		packets: make(chan shardedPacket, 4096),
 		done:    make(chan struct{}),
 	}
@@ -101,8 +105,12 @@ func listenSharded(addr *net.UDPAddr, shards int, readBuffer, writeBuffer int) (
 		c.conns = append(c.conns, conn)
 	}
 
+	warnShortBuffers(addr, c.conns[0], readBuffer, writeBuffer)
+
 	for _, conn := range c.conns {
 		go c.readLoop(conn)
+
+		c.writers = append(c.writers, newShardWriter(conn, c.done))
 	}
 
 	return c, nil
@@ -170,12 +178,17 @@ func (c *shardedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 // WriteTo sends on the socket this remote address belongs to.
+//
+// Queued rather than written: see shardWriter. The packet is copied, so the
+// caller has its buffer back the moment this returns, as it would from a
+// write.
 func (c *shardedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	if len(c.conns) == 1 {
-		return c.conns[0].WriteTo(p, addr)
+	shard := 0
+	if len(c.writers) > 1 {
+		shard = shardFor(addr, len(c.writers))
 	}
 
-	return c.conns[shardFor(addr, len(c.conns))].WriteTo(p, addr)
+	return c.writers[shard].enqueue(p, addr)
 }
 
 // shardFor is FNV-1a over the remote IP and port.
@@ -215,6 +228,9 @@ func (c *shardedPacketConn) Close() error {
 				c.closeErr = err
 			}
 		}
+		for _, w := range c.writers {
+			w.drain()
+		}
 	})
 
 	return c.closeErr
@@ -242,4 +258,25 @@ func (c *shardedPacketConn) SetWriteDeadline(t time.Time) error {
 	}
 
 	return nil
+}
+
+// warnShortBuffers says so when the kernel gave a socket less buffer than was
+// asked for, which it does without an error: SetReadBuffer succeeds and the
+// buffer is quietly capped at net.core.rmem_max, 208KiB by default. Media
+// arriving faster than a briefly delayed reader drains it is then dropped in
+// the kernel, counted only as RcvbufErrors in /proc/net/snmp, and seen as
+// publisher packet loss, keyframe requests and every viewer's picture
+// stuttering. Every shard is made the same way, so one is enough to check.
+func warnShortBuffers(addr *net.UDPAddr, conn *net.UDPConn, readBuffer, writeBuffer int) {
+	read, write, ok := socketBuffers(conn)
+	if !ok {
+		return
+	}
+
+	if readBuffer > 0 && read < readBuffer {
+		udpMuxLog.Warnf("sfu: %s got a %d byte receive buffer of the %d asked for; raise net.core.rmem_max on the host or media will be dropped under load", addr, read, readBuffer)
+	}
+	if writeBuffer > 0 && write < writeBuffer {
+		udpMuxLog.Warnf("sfu: %s got a %d byte send buffer of the %d asked for; raise net.core.wmem_max on the host", addr, write, writeBuffer)
+	}
 }

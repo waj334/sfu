@@ -9,7 +9,12 @@ import (
 	"strings"
 
 	"github.com/pion/ice/v4"
+	"github.com/pion/logging"
 )
+
+// udpMuxLog is where the mux says what it could not arrange; see
+// warnShortBuffers.
+var udpMuxLog = logging.NewDefaultLoggerFactory().NewLogger("sfu")
 
 type UDPMux struct {
 	Port    int
