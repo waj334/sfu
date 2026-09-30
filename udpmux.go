@@ -65,9 +65,9 @@ type UDPMuxOptions struct {
 	ShedTargetDelay time.Duration
 }
 
-// shedControllerRunning keeps shedding to one controller a process: the shares
-// it sets are the process's.
-var shedControllerRunning atomic.Bool
+// egressMonitorRunning keeps to one egress monitor a process: the queue wait
+// it samples and the shed shares it sets are the process's.
+var egressMonitorRunning atomic.Bool
 
 // NewUDPMux is ice.NewMultiUDPMuxFromPort with each address served by several
 // sockets rather than one. See shardedPacketConn.
@@ -101,10 +101,10 @@ func NewUDPMuxWithOptions(ctx context.Context, port int, opts UDPMuxOptions) *UD
 
 	mux := ice.NewMultiUDPMuxDefault(muxes...)
 
-	if target := opts.ShedTargetDelay; target > 0 && shedControllerRunning.CompareAndSwap(false, true) {
+	if egressMonitorRunning.CompareAndSwap(false, true) {
 		go func() {
-			defer shedControllerRunning.Store(false)
-			runShedController(localCtx, target)
+			defer egressMonitorRunning.Store(false)
+			runEgressMonitor(localCtx, opts.ShedTargetDelay)
 		}()
 	}
 

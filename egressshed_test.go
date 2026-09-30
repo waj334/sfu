@@ -1,6 +1,7 @@
 package sfu
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -116,4 +117,25 @@ func TestNoteQueueWaitKeepsTheLongest(t *testing.T) {
 	noteQueueWait(9 * time.Millisecond)
 	noteQueueWait(1 * time.Millisecond)
 	require.EqualValues(t, 9*time.Millisecond, egressQueueWaitMax.Swap(0))
+}
+
+// The wait is sampled with shedding off too, and shedding stays off.
+func TestEgressMonitorSamplesWithSheddingOff(t *testing.T) {
+	resetShedding(t)
+	egressQueueWaitSeen.Store(0)
+	t.Cleanup(func() { egressQueueWaitSeen.Store(0) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go runEgressMonitor(ctx, 0)
+
+	noteQueueWait(200 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		_, _, wait := EgressShedding()
+		return wait == 200*time.Millisecond
+	}, 3*shedTick, 10*time.Millisecond)
+
+	mid, low, _ := EgressShedding()
+	require.Zero(t, mid)
+	require.Zero(t, low)
 }

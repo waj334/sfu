@@ -97,13 +97,15 @@ func noteQueueWait(wait time.Duration) {
 	}
 }
 
-// runShedController adjusts the shed shares until ctx ends. A target of 0 or
-// less leaves shedding off.
-func runShedController(ctx context.Context, target time.Duration) {
-	if target <= 0 {
-		return
-	}
-
+// runEgressMonitor samples how long packets have waited in the send queues,
+// for EgressShedding, every shedTick until ctx ends, and with a target over 0
+// sheds and recovers against it too.
+//
+// The sampling runs whether or not shedding is on: the wait is how late
+// viewers are being sent their packets, which is worth watching on any node.
+// It was first only read by the shedding controller, so with shedding off the
+// gauge read zero even while a node was seconds behind.
+func runEgressMonitor(ctx context.Context, target time.Duration) {
 	ticker := time.NewTicker(shedTick)
 	defer ticker.Stop()
 
@@ -115,7 +117,9 @@ func runShedController(ctx context.Context, target time.Duration) {
 		case now := <-ticker.C:
 			wait := time.Duration(egressQueueWaitMax.Swap(0))
 			egressQueueWaitSeen.Store(int64(wait))
-			shedStepFor(now, wait, target, &lastShed, &calmSince)
+			if target > 0 {
+				shedStepFor(now, wait, target, &lastShed, &calmSince)
+			}
 		}
 	}
 }
