@@ -310,7 +310,8 @@ func NewClient(s *SFU, id string, name string, peerConnectionConfig webrtc.Confi
 		}
 	}
 
-	statsInterceptorFactory, err := stats.NewInterceptor()
+	// Outgoing RTP counted rather than recorded: see countingRecorder.
+	statsInterceptorFactory, err := stats.NewInterceptor(stats.SetRecorderFactory(newCountingRecorder))
 	if err != nil {
 		panic(err)
 	}
