@@ -23,3 +23,7 @@ go.work
 *.lock
 __debug_bin*
 main
+
+# Big Buck Bunny encode intermediates (media/bbb/encode.sh)
+media/bbb/work/
+media/bbb/encode.log
