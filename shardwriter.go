@@ -351,6 +351,13 @@ func (w *shardWriter) sendSegmented(pending []outboundPacket) {
 	for sent := 0; sent < len(msgs); {
 		egressSyscalls.Add(1)
 		n, err := w.batch.WriteBatch(msgs[sent:], 0)
+		// A sendmmsg that fails outright returns -1, and WriteBatch passes it
+		// through beside the error: nothing was sent. Taken as a count it
+		// sliced backwards and brought the node down, the moment thousands of
+		// viewers went at once and their addresses stopped taking packets.
+		if n < 0 {
+			n = 0
+		}
 		for _, s := range w.segs[sent : sent+n] {
 			egressPackets.Add(uint64(s))
 		}

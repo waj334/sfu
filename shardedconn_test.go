@@ -332,3 +332,59 @@ func testConcurrentWritersKeepOrder(t *testing.T, gso bool) {
 		}
 	}
 }
+
+// A sendmmsg whose first message the kernel refuses fails outright and returns
+// -1, which WriteBatch passes through with the error. Taken as a count of what
+// was sent it sliced backwards and panicked, taking the node down the moment
+// thousands of viewers left at once. The refused packets are given up on; the
+// ones after them still go.
+func TestSegmentedSendSurvivesARefusedFirstMessage(t *testing.T) {
+	c, err := listenSharded(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}, 1, 1<<20, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	w := c.writers[0]
+	if !w.gso.Load() {
+		t.Skip("no UDP segmentation offload here")
+	}
+
+	peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+
+	// Port 0: every UDP send to it is refused (EINVAL).
+	refused := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+	_, _, errorsBefore := UDPMuxEgressStats()
+
+	w.mu.Lock()
+	if _, err := c.WriteTo(make([]byte, 100), refused); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		p := make([]byte, 8)
+		binary.BigEndian.PutUint32(p, uint32(i))
+		if _, err := c.WriteTo(p, peer.LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.mu.Unlock()
+	w.flush()
+
+	buf := make([]byte, 64)
+	_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for i := 0; i < 3; i++ {
+		n, _, err := peer.ReadFromUDP(buf)
+		if err != nil {
+			t.Fatalf("after %d of 3: %v", i, err)
+		}
+		if got := binary.BigEndian.Uint32(buf[:n]); got != uint32(i) {
+			t.Fatalf("packet %d arrived as %d", i, got)
+		}
+	}
+	if _, _, errorsAfter := UDPMuxEgressStats(); errorsAfter-errorsBefore != 1 {
+		t.Fatalf("%d write errors counted; want the 1 refused packet", errorsAfter-errorsBefore)
+	}
+}
