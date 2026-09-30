@@ -388,3 +388,23 @@ func TestSegmentedSendSurvivesARefusedFirstMessage(t *testing.T) {
 		t.Fatalf("%d write errors counted; want the 1 refused packet", errorsAfter-errorsBefore)
 	}
 }
+
+// Each socket's send queue is as deep as asked, and 0 is the default.
+func TestShardedSendQueueDepth(t *testing.T) {
+	for _, tc := range []struct{ asked, want int }{
+		{0, DefaultWriteQueueDepth},
+		{-1, DefaultWriteQueueDepth},
+		{100, 100},
+	} {
+		c, err := listenShardedWithQueue(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}, 2, 0, 0, tc.asked)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, w := range c.writers {
+			if got := cap(w.queue); got != tc.want {
+				t.Errorf("asked for %d: queue holds %d, want %d", tc.asked, got, tc.want)
+			}
+		}
+		_ = c.Close()
+	}
+}

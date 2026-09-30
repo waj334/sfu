@@ -63,6 +63,12 @@ var shardedBuffers = sync.Pool{
 // kernel would quietly hand it a share of this node's traffic. So the address is
 // first taken without it, which fails the way binding a taken port always has.
 func listenSharded(addr *net.UDPAddr, shards int, readBuffer, writeBuffer int) (*shardedPacketConn, error) {
+	return listenShardedWithQueue(addr, shards, readBuffer, writeBuffer, 0)
+}
+
+// listenShardedWithQueue is listenSharded with each socket's send queue
+// queueDepth packets deep; 0 or less is DefaultWriteQueueDepth.
+func listenShardedWithQueue(addr *net.UDPAddr, shards int, readBuffer, writeBuffer, queueDepth int) (*shardedPacketConn, error) {
 	if shards < 1 || !reusePortSupported {
 		shards = 1
 	}
@@ -110,7 +116,7 @@ func listenSharded(addr *net.UDPAddr, shards int, readBuffer, writeBuffer int) (
 	for _, conn := range c.conns {
 		go c.readLoop(conn)
 
-		c.writers = append(c.writers, newShardWriter(conn, c.done))
+		c.writers = append(c.writers, newShardWriter(conn, c.done, queueDepth))
 	}
 
 	return c, nil

@@ -39,9 +39,24 @@ const udpMuxBufferSize = 67_108_864
 // rather than the lock in front of it is what is being waited on.
 const maxUDPMuxShards = 8
 
+// UDPMuxOptions tunes NewUDPMuxWithOptions; the zero value is NewUDPMux.
+type UDPMuxOptions struct {
+	// WriteQueueDepth is how many packets each socket queues for sending
+	// before writers wait: the node's buffer against a burst of sends. 0 is
+	// DefaultWriteQueueDepth. Deeper absorbs longer bursts, at up to 2KiB of
+	// pooled buffer per packet per socket while a node is behind, and packets
+	// that wait longer in it.
+	WriteQueueDepth int
+}
+
 // NewUDPMux is ice.NewMultiUDPMuxFromPort with each address served by several
 // sockets rather than one. See shardedPacketConn.
 func NewUDPMux(ctx context.Context, port int) *UDPMux {
+	return NewUDPMuxWithOptions(ctx, port, UDPMuxOptions{})
+}
+
+// NewUDPMuxWithOptions is NewUDPMux tuned by opts.
+func NewUDPMuxWithOptions(ctx context.Context, port int, opts UDPMuxOptions) *UDPMux {
 	localCtx, cancel := context.WithCancel(ctx)
 
 	shards := min(runtime.GOMAXPROCS(0), maxUDPMuxShards)
@@ -53,7 +68,7 @@ func NewUDPMux(ctx context.Context, port int) *UDPMux {
 
 	muxes := make([]ice.UDPMux, 0, len(addrs))
 	for _, addr := range addrs {
-		conn, err := listenSharded(&net.UDPAddr{IP: addr, Port: port}, shards, udpMuxBufferSize, udpMuxBufferSize)
+		conn, err := listenShardedWithQueue(&net.UDPAddr{IP: addr, Port: port}, shards, udpMuxBufferSize, udpMuxBufferSize, opts.WriteQueueDepth)
 		if err != nil {
 			for _, m := range muxes {
 				_ = m.Close()

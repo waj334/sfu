@@ -74,7 +74,8 @@ const (
 	// long. It goes round again if nobody else takes the lock.
 	maxFlushBatches = 16
 
-	// writeQueueDepth is how far writers can get ahead of the socket. Past it
+	// DefaultWriteQueueDepth is how far writers can get ahead of a socket
+	// unless UDPMuxOptions.WriteQueueDepth says otherwise. Past it
 	// a writer waits for the lock and makes room itself rather than dropping.
 	//
 	// It is the node's buffer against a burst: when it fills, every writer for
@@ -83,7 +84,7 @@ const (
 	// eight sockets, it held ~47ms of sending, and a few streams' keyframes
 	// landing together filled it. 16,384 holds ~190ms, and at most ~256MB of
 	// pooled buffers across the sockets when a node is behind.
-	writeQueueDepth = 16384
+	DefaultWriteQueueDepth = 16384
 )
 
 // Egress counters for the node's metrics: see UDPMuxEgressStats.
@@ -110,10 +111,15 @@ func UDPMuxEgressStats() (packets, syscalls, writeErrors uint64) {
 	return egressPackets.Load(), egressSyscalls.Load(), egressWriteErrors.Load()
 }
 
-func newShardWriter(conn *net.UDPConn, done chan struct{}) *shardWriter {
+// newShardWriter queues up to depth packets for conn; 0 or less is
+// DefaultWriteQueueDepth.
+func newShardWriter(conn *net.UDPConn, done chan struct{}, depth int) *shardWriter {
+	if depth <= 0 {
+		depth = DefaultWriteQueueDepth
+	}
 	w := &shardWriter{
 		conn:    conn,
-		queue:   make(chan outboundPacket, writeQueueDepth),
+		queue:   make(chan outboundPacket, depth),
 		pending: make([]outboundPacket, 0, maxWriteBatch),
 		msgs:    make([]ipv4.Message, maxWriteBatch),
 		done:    done,
