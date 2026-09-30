@@ -12,9 +12,17 @@ import (
 	"github.com/pion/logging"
 )
 
-// udpMuxLog is where the mux says what it could not arrange; see
-// warnShortBuffers.
-var udpMuxLog = logging.NewDefaultLoggerFactory().NewLogger("sfu")
+// udpMuxLog is where the mux says what it could not arrange: buffers the
+// kernel capped (warnShortBuffers), segmentation it refused (sendSegmented).
+//
+// At warning level by default. The default factory's is error, and a warning
+// logged through it goes nowhere unless PION_LOG_WARN names the scope, which is
+// how these were first written and never once seen. PION_LOG_* still override.
+var udpMuxLog = func() logging.LeveledLogger {
+	factory := logging.NewDefaultLoggerFactory()
+	factory.DefaultLogLevel = logging.LogLevelWarn
+	return factory.NewLogger("sfu")
+}()
 
 type UDPMux struct {
 	Port    int
