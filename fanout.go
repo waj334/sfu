@@ -23,6 +23,17 @@ import (
 // multiply payload memory by the subscriber count.
 const fanoutQueueDepth = 1024
 
+// fanoutDrops counts packets a subscriber was not given because its queue was
+// full: a viewer the node could not keep up with. See FanoutDrops.
+var fanoutDrops atomic.Uint64
+
+// FanoutDrops is how many packets the node has dropped for subscribers it had
+// fallen behind on. Anything but zero is a viewer seeing loss the network did
+// not cause: the node running out of room to send.
+func FanoutDrops() uint64 {
+	return fanoutDrops.Load()
+}
+
 type qualityFilteredTrack interface {
 	wantsQuality(QualityLevel) bool
 }
@@ -169,6 +180,7 @@ func (f *trackFanout) Push(packet *rtp.Packet, quality QualityLevel) {
 			// This subscriber is already behind. Keep every other subscriber
 			// flowing and, most importantly, keep draining publisher ingress.
 			shared.refs.Add(-1)
+			fanoutDrops.Add(1)
 		}
 	}
 
