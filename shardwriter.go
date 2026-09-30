@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -40,9 +41,17 @@ type shardWriter struct {
 	// see a packet that arrived while it held the lock: see flush.
 	queued atomic.Int64
 
-	mu      sync.Mutex // held by whoever is sending, and guards the two below
+	mu      sync.Mutex // held by whoever is sending, and guards the rest below
 	pending []outboundPacket
 	msgs    []ipv4.Message
+
+	// Segmentation offload: see sendSegmented. gso is cleared for good the
+	// first time the kernel refuses a segmented send.
+	gso   atomic.Bool
+	order []int    // pending, regrouped by destination
+	taken []bool   // which of pending are in order
+	oob   [][]byte // each message's segment-size control message
+	segs  []int    // how many packets each message carries
 
 	done chan struct{}
 }
@@ -69,7 +78,17 @@ var (
 	egressPackets     atomic.Uint64
 	egressSyscalls    atomic.Uint64
 	egressWriteErrors atomic.Uint64
+
+	segmentedSends   atomic.Uint64
+	segmentedPackets atomic.Uint64
 )
+
+// UDPMuxSegmentationStats is how much of the egress segmentation offload
+// carried: the sends that were segmented, and the packets in them. packets over
+// sends is how many packets the kernel handled as one.
+func UDPMuxSegmentationStats() (sends, packets uint64) {
+	return segmentedSends.Load(), segmentedPackets.Load()
+}
 
 // UDPMuxEgressStats is what the UDP mux has sent: packets, the system calls
 // they took, and the packets the kernel refused. packets/syscalls is the mean
@@ -87,10 +106,20 @@ func newShardWriter(conn *net.UDPConn, done chan struct{}) *shardWriter {
 		done:    done,
 	}
 	for i := range w.msgs {
-		w.msgs[i].Buffers = make([][]byte, 1)
+		w.msgs[i].Buffers = make([][]byte, 1, maxGSOSegments)
 	}
 	if local, ok := conn.LocalAddr().(*net.UDPAddr); ok && local.IP.To4() != nil {
 		w.batch = ipv4.NewPacketConn(conn)
+	}
+	if w.batch != nil && gsoSupported(conn) {
+		w.gso.Store(true)
+		w.order = make([]int, 0, maxWriteBatch)
+		w.taken = make([]bool, maxWriteBatch)
+		w.oob = make([][]byte, maxWriteBatch)
+		for i := range w.oob {
+			w.oob[i] = make([]byte, gsoOOBSize)
+		}
+		w.segs = make([]int, maxWriteBatch)
 	}
 	return w
 }
@@ -136,8 +165,18 @@ func (w *shardWriter) enqueue(p []byte, addr net.Addr) (int, error) {
 // and left, trusting the holder to send it. The count is added to before that
 // writer tries the lock and read here after this one lets it go, and atomics
 // are ordered, so the holder sees it.
+//
+// Before sending, the new sender yields once. Under load that lets the other
+// runnable writers — the rest of the frame this packet belongs to among them —
+// queue theirs first, so a batch holds whole frames for segmentation offload to
+// merge; flushed the moment each packet was written, batches averaged three
+// packets and rarely two for one viewer. On an idle node there is nothing else
+// to run and the yield returns at once.
 func (w *shardWriter) flush() {
 	for w.queued.Load() > 0 && w.mu.TryLock() {
+		if w.queued.Load() < maxWriteBatch {
+			runtime.Gosched()
+		}
 		w.sendQueued()
 		w.mu.Unlock()
 	}
@@ -187,10 +226,17 @@ func (w *shardWriter) send(pending []outboundPacket) {
 		return
 	}
 
+	if w.gso.Load() {
+		w.sendSegmented(pending)
+		return
+	}
+
 	msgs := w.msgs[:len(pending)]
 	for i, pkt := range pending {
+		msgs[i].Buffers = msgs[i].Buffers[:1]
 		msgs[i].Buffers[0] = (*pkt.buf)[:pkt.n]
 		msgs[i].Addr = pkt.addr
+		msgs[i].OOB = nil
 	}
 
 	batch := msgs
@@ -221,6 +267,151 @@ func (w *shardWriter) send(pending []outboundPacket) {
 		msgs[i].Buffers[0] = nil
 		msgs[i].Addr = nil
 	}
+}
+
+const (
+	// maxGSOSegments is the most packets one segmented send carries: the
+	// kernel's UDP_MAX_SEGMENTS on the oldest kernels that have it.
+	maxGSOSegments = 64
+
+	// maxGSOBytes keeps a segmented send inside one IP datagram's worth of
+	// payload, headers aside.
+	maxGSOBytes = 65000
+)
+
+// sendSegmented sends pending with segmentation offload: each destination's
+// packets go to the kernel as one send per run of equal-sized packets, and the
+// kernel carries each run through its stack as a single packet — UDP, IP,
+// conntrack, the virtual switch — cutting it into datagrams only where it
+// leaves. That per-packet work is what batching the system calls could not
+// touch: a third of the node's CPU at 2,000 viewers.
+//
+// A frame of video for one viewer is a run of full-size packets and a shorter
+// last one, which is exactly the shape a segmented send takes: every segment
+// the same size but the last, which may be smaller.
+//
+// pending is regrouped by destination first. Each destination's packets keep
+// their order; only packets for different destinations, which nothing orders
+// against one another, change places. Called holding mu.
+func (w *shardWriter) sendSegmented(pending []outboundPacket) {
+	order := w.order[:0]
+	taken := w.taken[:len(pending)]
+	for i := range taken {
+		taken[i] = false
+	}
+	for i := range pending {
+		if taken[i] {
+			continue
+		}
+		order = append(order, i)
+		for j := i + 1; j < len(pending); j++ {
+			if !taken[j] && sameUDPAddr(pending[i].addr, pending[j].addr) {
+				taken[j] = true
+				order = append(order, j)
+			}
+		}
+	}
+
+	// One message per run: the same destination, the same size, and at most
+	// one shorter packet, last.
+	count := 0
+	for k := 0; k < len(order); {
+		first := pending[order[k]]
+		size := first.n
+		m := &w.msgs[count]
+		m.Buffers = append(m.Buffers[:0], (*first.buf)[:first.n])
+		m.Addr = first.addr
+		total, segs := first.n, 1
+		k++
+		for k < len(order) && segs < maxGSOSegments {
+			p := pending[order[k]]
+			if p.n > size || total+p.n > maxGSOBytes || !sameUDPAddr(p.addr, first.addr) {
+				break
+			}
+			m.Buffers = append(m.Buffers, (*p.buf)[:p.n])
+			total += p.n
+			segs++
+			k++
+			if p.n < size {
+				break
+			}
+		}
+		if segs > 1 {
+			m.OOB = putGSOSize(w.oob[count], size)
+			segmentedSends.Add(1)
+			segmentedPackets.Add(uint64(segs))
+		} else {
+			m.OOB = nil
+		}
+		w.segs[count] = segs
+		count++
+	}
+
+	msgs := w.msgs[:count]
+	for sent := 0; sent < len(msgs); {
+		egressSyscalls.Add(1)
+		n, err := w.batch.WriteBatch(msgs[sent:], 0)
+		for _, s := range w.segs[sent : sent+n] {
+			egressPackets.Add(uint64(s))
+		}
+		sent += n
+		if err == nil {
+			if n == 0 {
+				// Nothing sent and nothing said: do not spin on it.
+				for _, s := range w.segs[sent:count] {
+					egressWriteErrors.Add(uint64(s))
+				}
+				break
+			}
+			continue
+		}
+		if sent >= len(msgs) {
+			break
+		}
+
+		if w.segs[sent] > 1 && isGSORefusal(err) {
+			// Segmentation is not available on this path after all. Stop
+			// asking, and send what is left one packet at a time.
+			w.gso.Store(false)
+			udpMuxLog.Warnf("sfu: %s: segmentation offload refused (%v); sending packets one at a time", w.conn.LocalAddr(), err)
+			for _, m := range msgs[sent:] {
+				for _, b := range m.Buffers {
+					egressSyscalls.Add(1)
+					if _, err := w.conn.WriteTo(b, m.Addr); err != nil {
+						egressWriteErrors.Add(1)
+					} else {
+						egressPackets.Add(1)
+					}
+				}
+			}
+			break
+		}
+
+		// sendmmsg reports the error of the first message it could not send,
+		// having sent the ones before it. That one is given up on.
+		egressWriteErrors.Add(uint64(w.segs[sent]))
+		sent++
+	}
+
+	for i := range msgs {
+		msgs[i].Buffers = msgs[i].Buffers[:1]
+		msgs[i].Buffers[0] = nil
+		msgs[i].Addr = nil
+		msgs[i].OOB = nil
+	}
+}
+
+// sameUDPAddr is whether two destinations are the same address and port.
+func sameUDPAddr(a, b net.Addr) bool {
+	ua, ok := a.(*net.UDPAddr)
+	if !ok {
+		return a.String() == b.String()
+	}
+	ub, ok := b.(*net.UDPAddr)
+	if !ok {
+		return false
+	}
+	return ua.Port == ub.Port && ua.IP.Equal(ub.IP)
 }
 
 // drain releases what was queued when the socket closed.

@@ -2,6 +2,7 @@ package sfu
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -142,11 +143,22 @@ func TestSocketBuffersReportsWhatTheKernelGranted(t *testing.T) {
 // batches: with the lock held as if mid-send, 100 writes queue up, and letting
 // go sends them in two sendmmsg calls (64 and 36), in the order written.
 func TestShardedWritesQueuedBehindASenderGoOutInBatches(t *testing.T) {
+	for _, gso := range []bool{true, false} {
+		t.Run(fmt.Sprintf("gso=%v", gso), func(t *testing.T) { testWritesQueuedBehindASender(t, gso) })
+	}
+}
+
+func testWritesQueuedBehindASender(t *testing.T, gso bool) {
 	c, err := listenSharded(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}, 1, 1<<20, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	if !gso {
+		for _, w := range c.writers {
+			w.gso.Store(false)
+		}
+	}
 
 	peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -181,19 +193,101 @@ func TestShardedWritesQueuedBehindASenderGoOutInBatches(t *testing.T) {
 		}
 	}
 
+	// Two sendmmsg of 64 and 36, segmented or not: a batch is taken 64
+	// packets at a time and segmentation only changes what each call carries.
 	if _, callsAfter, _ := UDPMuxEgressStats(); callsAfter-callsBefore != 2 {
 		t.Fatalf("%d system calls for %d queued packets; want 2", callsAfter-callsBefore, queued)
+	}
+}
+
+// Segmented sends: frames for two viewers, interleaved as a node fanning out
+// queues them, each a run of full-size packets and a shorter last one. Each
+// viewer has to receive exactly the datagrams it was sent, one per packet, at
+// their own sizes and in their own order.
+func TestSegmentedSendsArriveAsTheDatagramsTheyWere(t *testing.T) {
+	c, err := listenSharded(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}, 1, 1<<20, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	w := c.writers[0]
+	if !w.gso.Load() {
+		t.Skip("no UDP segmentation offload here")
+	}
+
+	peers := make([]*net.UDPConn, 2)
+	for i := range peers {
+		peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer peer.Close()
+		_ = peer.SetReadBuffer(4 << 20)
+		peers[i] = peer
+	}
+
+	// Per frame: five full packets and a short one, for each viewer in turn.
+	sizes := []int{1200, 1200, 1200, 1200, 1200, 317}
+	const frames = 10
+	sent := make([][][]byte, len(peers))
+
+	w.mu.Lock()
+	seq := 0
+	for f := 0; f < frames; f++ {
+		for _, size := range sizes {
+			for i, peer := range peers {
+				p := make([]byte, size)
+				binary.BigEndian.PutUint32(p, uint32(seq))
+				seq++
+				sent[i] = append(sent[i], p)
+				if _, err := c.WriteTo(p, peer.LocalAddr()); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	w.mu.Unlock()
+	w.flush()
+
+	if !w.gso.Load() {
+		t.Fatal("the kernel refused segmentation offload on loopback")
+	}
+
+	buf := make([]byte, 2048)
+	for i, peer := range peers {
+		_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for k, want := range sent[i] {
+			n, _, err := peer.ReadFromUDP(buf)
+			if err != nil {
+				t.Fatalf("peer %d after %d of %d: %v", i, k, len(sent[i]), err)
+			}
+			if n != len(want) || binary.BigEndian.Uint32(buf[:4]) != binary.BigEndian.Uint32(want[:4]) {
+				t.Fatalf("peer %d datagram %d: got %d bytes, seq %d; want %d bytes, seq %d",
+					i, k, n, binary.BigEndian.Uint32(buf[:4]), len(want), binary.BigEndian.Uint32(want[:4]))
+			}
+		}
 	}
 }
 
 // Many writers at once, as a node fanning out has: every packet arrives, and
 // each peer's in the order they were written for it.
 func TestShardedConcurrentWritersKeepEachPeerInOrder(t *testing.T) {
+	for _, gso := range []bool{true, false} {
+		t.Run(fmt.Sprintf("gso=%v", gso), func(t *testing.T) { testConcurrentWritersKeepOrder(t, gso) })
+	}
+}
+
+func testConcurrentWritersKeepOrder(t *testing.T, gso bool) {
 	c, err := listenSharded(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}, 4, 1<<20, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	if !gso {
+		for _, w := range c.writers {
+			w.gso.Store(false)
+		}
+	}
 
 	const writers, each = 8, 500
 	peers := make([]*net.UDPConn, writers)
