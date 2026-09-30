@@ -5,6 +5,7 @@ package pacer
 import (
 	"container/list"
 	"errors"
+	"maps"
 	"sync"
 	"time"
 
@@ -141,6 +142,9 @@ func (p *LeakyBucketPacer) getQueue(ssrc uint32) *queue {
 // Write sends a packet with header and payload the a previously registered
 // stream.
 func (p *LeakyBucketPacer) Write(header *rtp.Header, payload []byte, attributes interceptor.Attributes) (int, error) {
+	// A copy: the attributes are the caller's again once Write returns, and
+	// the packet is queued past that.
+	attributes = maps.Clone(attributes)
 	pkt := p.rtppool.NewPacket(header, payload, attributes)
 
 	queue := p.getQueue(header.SSRC)
