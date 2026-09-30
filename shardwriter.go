@@ -68,9 +68,22 @@ const (
 	// batch does not hold the socket for long.
 	maxWriteBatch = 64
 
+	// maxFlushBatches is the most a writer that took the lock in passing sends
+	// before letting it go: long enough to share system calls well, short
+	// enough (~1,000 packets, ~12ms) that a writer waiting on it is not kept
+	// long. It goes round again if nobody else takes the lock.
+	maxFlushBatches = 16
+
 	// writeQueueDepth is how far writers can get ahead of the socket. Past it
 	// a writer waits for the lock and makes room itself rather than dropping.
-	writeQueueDepth = 4096
+	//
+	// It is the node's buffer against a burst: when it fills, every writer for
+	// the socket queues on its lock, and it is then that subscribers' own
+	// fan-out queues overflow and drop. At 4,096, with ~690k packets/s over
+	// eight sockets, it held ~47ms of sending, and a few streams' keyframes
+	// landing together filled it. 16,384 holds ~190ms, and at most ~256MB of
+	// pooled buffers across the sockets when a node is behind.
+	writeQueueDepth = 16384
 )
 
 // Egress counters for the node's metrics: see UDPMuxEgressStats.
@@ -150,9 +163,15 @@ func (w *shardWriter) enqueue(p []byte, addr net.Addr) (int, error) {
 			return len(p), nil
 		default:
 			// Full: whoever is sending is not keeping up. Wait to be the
-			// sender and make room, as a write once waited on the socket.
+			// sender and make room, as a write once waited on the socket:
+			// one batch, enough for this packet and a few more, and no more.
+			// Every writer that finds the queue full waits here in line, so
+			// what each does with its turn is what the last in line waits
+			// for; a turn that drained the whole queue made a line of
+			// hundreds wait seconds, and their subscribers' own queues
+			// overflowed meanwhile.
 			w.mu.Lock()
-			w.sendQueued()
+			w.sendQueued(1)
 			w.mu.Unlock()
 		}
 	}
@@ -177,15 +196,16 @@ func (w *shardWriter) flush() {
 		if w.queued.Load() < maxWriteBatch {
 			runtime.Gosched()
 		}
-		w.sendQueued()
+		w.sendQueued(maxFlushBatches)
 		w.mu.Unlock()
 	}
 }
 
-// sendQueued sends everything queued, in batches. Called holding mu.
-func (w *shardWriter) sendQueued() {
+// sendQueued sends what is queued, in batches, until the queue is empty or it
+// has sent batches of them. Called holding mu.
+func (w *shardWriter) sendQueued(batches int) {
 	pending := w.pending[:0]
-	for {
+	for ; batches > 0; batches-- {
 	fill:
 		for len(pending) < maxWriteBatch {
 			select {
