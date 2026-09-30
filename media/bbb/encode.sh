@@ -5,7 +5,8 @@
 #
 #   thirdparty/sfu/media/bbb/encode.sh ~/Downloads/big_buck_bunny_720p_h264.mov
 #
-# FPS_SETS limits it to some of the sets, SECONDS_OF_SOURCE changes the minute.
+# FPS_SETS limits it to some of the sets, SECONDS_OF_SOURCE changes the minute,
+# GOP_SECONDS the keyframe interval (into <fps>-gop<N>).
 #
 # Writes <fps>/output-{720p,360p,180p}.{h264,h265} and <fps>/output.ogg next to
 # this script: the names the publisher reads, so a set is chosen with
@@ -20,6 +21,11 @@
 #     cost of keyframes is the same in every run, and every one an IDR: x265's
 #     default open GOP makes them CRA pictures, which a phone recovering from
 #     loss or joining mid-stream may not start decoding from.
+#   - H.265 without weighted prediction. libwebrtc's H.265 slice header
+#     parser, which a viewer runs on every frame only to read its QP, misreads
+#     the prediction weight table and loses its place: "Failed to parse
+#     bitstream", "five_minus_max_num_merge_cand ... found N", hundreds a
+#     minute. The decoder is not affected, but the log is unreadable.
 #   - H.264 Constrained Baseline, which is what the publisher advertises
 #     (profile-level-id 42e01f) and every WebRTC decoder takes.
 #   - Opus at 48kHz stereo in 20ms packets, one per Ogg page: the publisher
@@ -36,6 +42,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 seconds="${SECONDS_OF_SOURCE:-60}"
 # Which sets to make; FPS_SETS=24 makes only the native-rate one.
 read -r -a sets <<<"${FPS_SETS:-24 30 60}"
+# Seconds between keyframes. Anything but 2 is written to <fps>-gop<N>, so a
+# set with a longer interval sits beside the standard one to compare against.
+gop_seconds="${GOP_SECONDS:-2}"
+suffix=""
+if [[ "$gop_seconds" != 2 ]]; then suffix="-gop$gop_seconds"; fi
 work="$here/work"
 mkdir -p "$work"
 
@@ -64,7 +75,7 @@ intermediate() {
 
 encode() {
 	local fps="$1" name="$2" width="$3" height="$4" h264="$5" h265="$6"
-	local dir="$here/$fps" gop=$((fps * 2))
+	local dir="$here/$fps$suffix" gop=$((fps * gop_seconds))
 	local scale="scale=$width:$height:flags=lanczos"
 	mkdir -p "$dir"
 
@@ -82,7 +93,7 @@ encode() {
 	ff -i "$work/source-$fps.mkv" -vf "$scale" -r "$fps" \
 		-c:v libx265 -preset medium -profile:v main -pix_fmt yuv420p \
 		-b:v "${h265}k" -maxrate "${h265}k" -bufsize "${h265}k" \
-		-x265-params "log-level=error:bframes=0:keyint=$gop:min-keyint=$gop:scenecut=0:open-gop=0:repeat-headers=1:vbv-maxrate=$h265:vbv-bufsize=$h265" \
+		-x265-params "log-level=error:bframes=0:keyint=$gop:min-keyint=$gop:scenecut=0:open-gop=0:weightp=0:repeat-headers=1:vbv-maxrate=$h265:vbv-bufsize=$h265" \
 		-f hevc "$dir/output-$name.h265"
 }
 
@@ -103,7 +114,7 @@ for fps in "${sets[@]}"; do
 		echo "==> $fps fps $name"
 		encode "$fps" "$name" "$width" "$height" "${h264[$i]}" "${h265[$i]}"
 	done
-	cp "$work/output.ogg" "$here/$fps/output.ogg"
+	cp "$work/output.ogg" "$here/$fps$suffix/output.ogg"
 done
 
 echo "==> done; $work holds the intermediates and can be deleted"
